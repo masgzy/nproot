@@ -1,5 +1,6 @@
-#include <stdio.h>     /* rename(2), */
+#include <stdio.h>     /* rename(2), renameat(2), */
 #include <stdlib.h>    /* atoi */
+#include <fcntl.h>     /* open(2), openat(2), AT_FDCWD, O_*, */
 #include <unistd.h>    /* symlink(2), symlinkat(2), readlink(2), lstat(2), unlink(2), unlinkat(2)*/
 #include <string.h>    /* str*, strrchr, strcat, strcpy, strncpy, strncmp */
 #include <sys/types.h> /* lstat(2), */
@@ -84,14 +85,214 @@ static struct {
 static size_t fd_cache_index;
 
 /**
+ * The directory PROOT_L2S_DIR asks the backing files to be kept in,
+ * remembered as a descriptor rather than as a name.
+ *
+ * It has to be a descriptor because the operations below are performed
+ * by PRoot itself, with raw host syscalls that no translation applies
+ * to: a tracee that replaces the directory with a symbolic link -- it
+ * only takes "rm -rf" and "ln -s" on a path it owns, inside its own
+ * rootfs, with no concurrency and nothing bound from the host -- has
+ * every backing file created outside the rootfs from then on, at a
+ * destination of its choosing.  The name is resolved afresh by every
+ * one of those syscalls, so checking it beforehand settles nothing;
+ * opening it once, O_NOFOLLOW, and naming each entry (descriptor, name)
+ * afterwards is what ties the writes to the inode that was checked.
+ *
+ * The paths recorded *inside* the symbolic links are deliberately left
+ * as they were, that is, absolute host paths into this directory: that
+ * is what the canonicalization dereferences them through, c.f.
+ * detranslate_path().  Only the syscalls change, never the contents.
+ *
+ * A tracee that re-points the directory afterwards therefore no longer
+ * redirects anything; it merely breaks the links of its own rootfs,
+ * since the descriptor still names the directory the paths spell out.
+ */
+static char l2s_directory[PATH_MAX];
+static size_t l2s_directory_length;
+static int l2s_directory_fd = -1;
+static bool l2s_directory_known;
+
+/**
+ * Copy PROOT_L2S_DIR into @l2s_directory, without its trailing slashes
+ * so that a path can be matched against it by comparison.  This
+ * function returns false if no l2s directory is configured, in which
+ * case each intermediate is created next to the file it stands for and
+ * there is nothing here to protect: that path is canonicalized, hence
+ * already confined to the guest rootfs.
+ */
+static bool get_l2s_directory(void)
+{
+	const char *value;
+	size_t length;
+
+	if (l2s_directory_known)
+		return l2s_directory[0] != '\0';
+
+	l2s_directory_known = true;
+
+	value = getenv("PROOT_L2S_DIR");
+	if (value == NULL || value[0] == '\0')
+		return false;
+
+	length = strlen(value);
+	if (length >= PATH_MAX)
+		return false;
+
+	while (length > 1 && value[length - 1] == '/')
+		length--;
+
+	memcpy(l2s_directory, value, length);
+	l2s_directory[length] = '\0';
+	l2s_directory_length = length;
+
+	return true;
+}
+
+/**
+ * Answer a descriptor on the l2s directory, opening it on first use.
+ * This function returns -errno if it can't be opened -- O_NOFOLLOW, so
+ * a symbolic link left under that name is a refusal and not something
+ * to follow.
+ */
+static int open_l2s_directory(void)
+{
+	if (l2s_directory_fd >= 0)
+		return l2s_directory_fd;
+
+	if (!get_l2s_directory())
+		return -ENOENT;
+
+	l2s_directory_fd = open(l2s_directory,
+				O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (l2s_directory_fd < 0)
+		return errno > 0 ? -errno : -ENOENT;
+
+	return l2s_directory_fd;
+}
+
+/**
+ * Tell how @path has to be named.  On success *@dir_fd is a descriptor
+ * on the l2s directory and *@name is the entry in it, or *@dir_fd is -1
+ * and *@name is @path itself when @path doesn't lie directly in that
+ * directory -- no l2s directory configured, an intermediate created
+ * next to its file, or a chain some older version left elsewhere.
+ *
+ * This function returns -1 with errno set when @path *is* in the l2s
+ * directory but that directory can't be opened.  Falling back to the
+ * plain path there would defeat the whole point, since that is exactly
+ * the state a tracee arranges when it wants the operation to land
+ * somewhere else.
+ */
+static int l2s_entry(const char *path, int *dir_fd, const char **name)
+{
+	const char *base;
+	int fd;
+
+	*dir_fd = -1;
+	*name = path;
+
+	if (!get_l2s_directory())
+		return 0;
+
+	if (strncmp(path, l2s_directory, l2s_directory_length) != 0
+	    || path[l2s_directory_length] != '/')
+		return 0;
+
+	base = path + l2s_directory_length + 1;
+	if (base[0] == '\0' || strchr(base, '/') != NULL)
+		return 0;
+
+	fd = open_l2s_directory();
+	if (fd < 0) {
+		errno = -fd;
+		return -1;
+	}
+
+	*dir_fd = fd;
+	*name = base;
+
+	return 0;
+}
+
+/**
+ * The handful of operations this extension performs on the l2s
+ * directory, each naming its entry relative to the descriptor above
+ * when that is where it lies.  They keep the return convention of the
+ * calls they stand for: 0 or -1 with errno set.
+ */
+static int l2s_access(const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	/* No AT_SYMLINK_NOFOLLOW: access(2) follows, and a dangling
+	 * intermediate has always counted as a free slot here.  */
+	return (dir_fd < 0) ? access(path, F_OK) : faccessat(dir_fd, name, F_OK, 0);
+}
+
+static int l2s_symlink(const char *target, const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	return (dir_fd < 0) ? symlink(target, path) : symlinkat(target, dir_fd, name);
+}
+
+static int l2s_unlink(const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	return (dir_fd < 0) ? unlink(path) : unlinkat(dir_fd, name, 0);
+}
+
+static int l2s_rename(const char *old_path, const char *new_path)
+{
+	const char *old_name;
+	const char *new_name;
+	int old_dir_fd;
+	int new_dir_fd;
+
+	if (l2s_entry(old_path, &old_dir_fd, &old_name) < 0)
+		return -1;
+	if (l2s_entry(new_path, &new_dir_fd, &new_name) < 0)
+		return -1;
+
+	if (old_dir_fd < 0 && new_dir_fd < 0)
+		return rename(old_path, new_path);
+
+	/* An absolute path with AT_FDCWD is the side that isn't in the
+	 * l2s directory -- the file being moved into it, typically.  */
+	return renameat(old_dir_fd < 0 ? AT_FDCWD : old_dir_fd, old_name,
+			new_dir_fd < 0 ? AT_FDCWD : new_dir_fd, new_name);
+}
+
+/**
  * Copy the contents of the @symlink into @value (nul terminated).
  * This function returns -errno if an error occured, otherwise 0.
  */
 static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
 {
+	const char *name;
+	int dir_fd;
 	ssize_t size;
 
-	size = readlink(symlink, value, PATH_MAX);
+	if (l2s_entry(symlink, &dir_fd, &name) < 0)
+		return -errno;
+
+	size = (dir_fd < 0)
+		? readlink(symlink, value, PATH_MAX)
+		: readlinkat(dir_fd, name, value, PATH_MAX);
 	if (size < 0)
 		return size;
 	if (size >= PATH_MAX)
@@ -288,7 +489,6 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	char final[PATH_MAX];
 	char new_final[PATH_MAX];
 	char * name;
-	const char * l2s_directory;
 	struct stat statl;
 	ssize_t size;
 	int status;
@@ -333,15 +533,28 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		else
 			name++;
 
-		l2s_directory = getenv("PROOT_L2S_DIR");
-		if (l2s_directory != NULL && l2s_directory[0]) {
-			if (strlen(PREFIX) + strlen(l2s_directory) + (strlen(original) - strlen(name)) + 6 >= PATH_MAX)
+		if (get_l2s_directory()) {
+			/* "<l2s>/<PREFIX><name>" plus the four digits of the
+			 * suffix and the ".0002" of the final file.  The
+			 * bound used to be computed from the *directory* of
+			 * @original, which says nothing about the length of
+			 * the name appended here: a short directory and a
+			 * long name passed it and then overran these
+			 * buffers.  */
+			if (l2s_directory_length + strlen(PREFIX) + strlen(name) + 11 >= PATH_MAX)
 				return -ENAMETOOLONG;
 
+			/* Ask for the descriptor here, so a directory that
+			 * can't be opened is reported with the reason it
+			 * can't -- ENOTDIR for the symbolic link a tracee
+			 * left under that name -- instead of surfacing as
+			 * whichever of the operations below fails first.  */
+			status = open_l2s_directory();
+			if (status < 0)
+				return status;
+
 			strcpy(intermediate, l2s_directory);
-			if (l2s_directory[strlen(l2s_directory) - 1] != '/') {
-				strcat(intermediate, "/");
-			}
+			strcat(intermediate, "/");
 		} else {
 			if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
 				return -ENAMETOOLONG;
@@ -358,12 +571,12 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		do {
 			sprintf(new_intermediate, "%s%04d", intermediate, intermediate_suffix);
 			intermediate_suffix++;
-		} while ((access(new_intermediate,F_OK) != -1) && (intermediate_suffix < 1000));
+		} while ((l2s_access(new_intermediate) != -1) && (intermediate_suffix < 1000));
 		strcpy(intermediate, new_intermediate);
 
 		strcpy(final, intermediate);
 		strcat(final, ".0002");
-		status = rename(original, final);
+		status = l2s_rename(original, final);
 		if (status < 0)
 			return status;
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final);
@@ -371,7 +584,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			return status;
 
 		/* Symlink the intermediate to the final file.  */
-		status = symlink(final, intermediate);
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
 			return status;
 
@@ -391,7 +604,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		strncpy(new_final, final, strlen(final) - 4);
 		sprintf(new_final + strlen(final) - 4, "%04d", link_count);
 
-		status = rename(final, new_final);
+		status = l2s_rename(final, new_final);
 		if (status < 0)
 			return status;
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
@@ -399,10 +612,10 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			return status;
 		strcpy(final, new_final);
 		/* Symlink the intermediate to the final file.  */
-		status = unlink(intermediate);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
 			return status;
-		status = symlink(final, intermediate);
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
 			return status;
 	}
@@ -488,7 +701,7 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 		strncpy(new_final, final, strlen(final) - 4);
 		sprintf(new_final + strlen(final) - 4, "%04d", link_count);
 
-		status = rename(final, new_final);
+		status = l2s_rename(final, new_final);
 		if (status < 0)
 			return status;
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
@@ -498,19 +711,19 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 		strcpy(final, new_final);
 
 		/* Symlink the intermediate to the final file.  */
-		status = unlink(intermediate);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
 			return status;
 
-		status = symlink(final, intermediate);
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
 			return status;
 	} else {
 		/* If it is the last, delete the intermediate and final */
-		status = unlink(intermediate);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
 			return status;
-		status = unlink(final);
+		status = l2s_unlink(final);
 		if (status < 0)
 			return status;
 		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final, 0);
