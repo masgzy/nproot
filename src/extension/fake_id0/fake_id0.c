@@ -794,6 +794,9 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 			char fdinfo_path[64];
 			char line[64];
 			unsigned int existing_flags = 0;
+			int have_flags = 0;
+			int requested_flags = (int) peek_reg(tracee, CURRENT, SYSARG_3);
+			struct stat target;
 			FILE *fdinfo;
 
 			snprintf(fdinfo_path, sizeof(fdinfo_path),
@@ -801,12 +804,28 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 			fdinfo = fopen(fdinfo_path, "r");
 			if (fdinfo != NULL) {
 				while (fgets(line, sizeof(line), fdinfo) != NULL) {
-					if (sscanf(line, "flags: %o", &existing_flags) == 1)
+					if (sscanf(line, "flags: %o", &existing_flags) == 1) {
+						have_flags = 1;
 						break;
+					}
 				}
 				fclose(fdinfo);
 			}
 			if (existing_flags & O_PATH)
+				return 0;
+
+			/* dup() shares the open file description, so it keeps the
+			 * existing access mode instead of the requested one.
+			 * Reopening a regular file or memfd with a different mode
+			 * is how programs derive a reduced-access handle (e.g. a
+			 * read-only memfd to hand to another process); a writable
+			 * dup there silently breaks that guarantee.  Let the
+			 * kernel do the real reopen for those; keep the dup for
+			 * ttys/pipes/sockets, which is what this was added for. */
+			if (have_flags
+			    && (existing_flags & O_ACCMODE) != (unsigned int) (requested_flags & O_ACCMODE)
+			    && stat(path, &target) == 0
+			    && S_ISREG(target.st_mode))
 				return 0;
 		}
 
