@@ -1,0 +1,122 @@
+name: nproot CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-ndk:
+    name: android (aarch64, bionic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Show NDK
+        run: |
+          echo "NDK: ${ANDROID_NDK_LATEST_HOME}"
+          ls "${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head -5
+
+      - name: Build talloc for Android
+        run: |
+          set -eux
+          curl -sO https://www.samba.org/ftp/talloc/talloc-2.4.2.tar.gz
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          LD="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          ./configure --prefix="$PWD/../talloc-out" --cross-compile \
+                      --disable-python --disable-rpath --without-gettext
+          make -j"$(nproc)"
+          make install
+
+      - name: Build nproot
+        run: |
+          set -eux
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          make -C src -j"$(nproc)" CC="$CC" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            LDFLAGS="-L$PWD/talloc-out/lib -ltalloc -Wl,-z,noexecstack"
+          file src/nproot
+
+      - name: Smoke test on host is impossible for bionic; verify the artifact
+        run: |
+          test -x src/nproot
+          test -x src/loader/loader || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nproot-android-arm64
+          path: |
+            src/nproot
+            src/loader/loader
+
+  musl-static:
+    name: musl (x86_64, static)
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-alpine
+    timeout-minutes: 30
+    steps:
+      - name: Install toolchain
+        run: apk add --no-cache build-base make python3 git file linux-headers
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build talloc (native musl)
+        run: |
+          set -eux
+          wget -q https://www.samba.org/ftp/talloc/talloc-2.4.2.tar.gz
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          ./configure --prefix="$PWD/../talloc-out" --disable-python --disable-rpath
+          make -j"$(nproc)"
+          make install
+
+      - name: Build nproot (static)
+        run: |
+          set -eux
+          make -C src -j"$(nproc)" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            LDFLAGS="-L$PWD/talloc-out/lib -static -ltalloc -Wl,-z,noexecstack"
+          file src/nproot | grep -i "statically linked"
+
+      - name: Backend demos (host tests inside the container)
+        run: make -C src/backend check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nproot-musl-x86_64-static
+          path: src/nproot
+
+  spike:
+    name: spike probes (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run feasibility probes
+        run: make -C spike check
+
+      - name: Backend demos
+        run: make -C src/backend check
