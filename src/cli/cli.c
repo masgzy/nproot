@@ -128,11 +128,11 @@ static void print_execve_help(const Tracee *tracee, const char *argv0, int statu
 {
 	note(tracee, ERROR, SYSTEM, "execve(\"%s\")", argv0);
 
-	/* termux-exec replaced execve with path with one that doesn't exist inside proot?  */
+	/* termux-exec replaced execve with path with one that doesn't exist inside nproot?  */
 	if (status == -ENOENT && getenv("LD_PRELOAD") != NULL && strstr(getenv("LD_PRELOAD"), "libtermux-exec.so") != NULL) {
 		note(tracee, INFO, USER,
 "It seems that termux-exec is active and is prepending /data/data/com.termux/... to executable paths\n"
-"If this is path is not available inside proot, please \"unset LD_PRELOAD\"");
+"If this is path is not available inside nproot, please \"unset LD_PRELOAD\"");
 		return;
 	}
 

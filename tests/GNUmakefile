@@ -1,6 +1,6 @@
 DIR    = $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
 ROOTFS = $(DIR)/rootfs
-PROOT  = $(DIR)/../src/proot
+PROOT  = $(DIR)/../src/nproot
 CC     = gcc
 PROOT_RAW = $(PROOT)
 

@@ -6,5 +6,13 @@
 /src/loader/loader-m32
 /src/loader/loader-info.c
 /src/proot
-
+/src/nproot
+/src/backend/demo-ptrace
+/src/backend/demo-seccomp
+/spike/unotify-probe
+/spike/trap-probe
+/proto/preload/libnproot.so
+/proto/preload/libnproot-musl.so
+/proto/launcher/nproot-lite
+/tests/tmp/
 *~

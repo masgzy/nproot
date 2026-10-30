@@ -75,16 +75,13 @@ static int post_initialize_exe(Tracee *, const Cli *, size_t, char *const *, siz
 
 static Cli proot_cli = {
 	.version  = VERSION,
-	.name     = "proot",
+	.name     = "nproot",
 	.subtitle = "chroot, mount --bind, and binfmt_misc without privilege/setup",
-	.synopsis = "proot [option] ... [command]",
-	.colophon = "Visit http://proot.me for help, bug reports, suggestions, patchs, ...\n\
+	.synopsis = "nproot [option] ... [command]",
+	.colophon = "Visit https://github.com/masgzy/nproot for help, bug reports, suggestions, patches, ...\n\
 Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
 	.logo = "\
- _____ _____              ___\n\
-|  __ \\  __ \\_____  _____|   |_\n\
-|   __/     /  _  \\/  _  \\    _|\n\
-|__|  |__|__\\_____/\\_____/\\____|",
+nproot -- no-ptrace proot / neo proot",
 
 	.pre_initialize_bindings = pre_initialize_bindings,
 	.post_initialize_exe = post_initialize_exe,
