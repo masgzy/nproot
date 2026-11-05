@@ -1,0 +1,180 @@
+name: "AVD 实机测试（真实 zygote seccomp）"
+
+# 在 GitHub 托管的 KVM Android 模拟器里，通过真实 Termux 会话驱动 nproot
+# 的 proto 后端跑一个 glibc (Debian) 容器。与 tests.yml 里的"策略重放"
+# 作业互为补充：那里用 gen_policy.py 复刻 AOSP 白名单，这里面对的是
+# 模拟器里货真价实的 zygote 过滤器。
+#
+# 前置实测（见仓库外 KVM-Storage-Probe 文档）：
+#   - /dev/kvm 需要 chmod 666 修复，否则模拟器静默降级软模拟、开机极慢
+#   - 不做磁盘极限清理：预装 SDK 直接复用，AVD 栈约 6 GB，runner 初始
+#     可用空间远大于此，清理只浪费时间
+#   - 模拟器内通过 10.0.2.2 回连 runner 上的 HTTP 服务取测试脚本与产物
+#
+# 交互方式：向真实 Termux 终端键入两条命令（curl 取脚本 / bash 执行），
+# 输出落 Termux home 的 avd-out.txt，由 adb 以 root 拉回；全程截图作为
+# artifact 保留 15 天。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  avd-nproot:
+    name: Termux + Debian (glibc) on real Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TERMUX_APK: termux-app_v0.118.3+github-debug_x86_64.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the static x86_64 nproot (musl, Termux-ready)
+        run: |
+          set -eux
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq musl-tools >/dev/null
+          # tracee.h needs sys/queue.h, which musl's headers lack; the
+          # kernel UAPI headers (linux/, asm) live in linux-libc-dev and
+          # must be copied into the musl include dir because musl-gcc
+          # compiles with -nostdinc
+          sudo cp /usr/include/x86_64-linux-gnu/sys/queue.h \
+            /usr/include/x86_64-linux-musl/sys/queue.h
+          sudo cp -r /usr/include/linux /usr/include/x86_64-linux-musl/
+          sudo cp -r /usr/include/x86_64-linux-gnu/asm \
+            /usr/include/x86_64-linux-musl/
+          sudo cp -r /usr/include/asm-generic /usr/include/x86_64-linux-musl/
+          sh build-aux/fetch-talloc.sh
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          CC=musl-gcc ./configure --prefix="$PWD/../talloc-out" \
+            --disable-python --disable-rpath
+          make -j"$(nproc)"
+          make install
+          ar qf "$PWD/../talloc-out/lib/libtalloc.a" \
+            bin/default/talloc.c*.o \
+            bin/default/lib/replace/replace.c*.o
+          cd ..
+          make -C src -j"$(nproc)" \
+            CC=musl-gcc HAS_LOADER_32BIT= \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            TALLOC_LINK="$PWD/talloc-out/lib/libtalloc.a" \
+            LDFLAGS="-static -Wl,-z,noexecstack"
+          if readelf -d src/nproot | grep -q NEEDED; then
+            echo "nproot is not statically linked" >&2
+            exit 1
+          fi
+          file src/nproot
+
+      - name: Cross-build the x86_64 guest shims (zig)
+        run: |
+          set -eux
+          pip install ziglang
+          make -C proto android-x86_64 ZIG="python3 -m ziglang"
+          file proto/bin/x86_64/preload/libnproot.so
+
+      - name: Fetch pd (proot-distro-i18n) and build its wheel
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/masgzy/proot-distro-i18n
+          pip wheel --no-deps -w www ./proot-distro-i18n
+          WHEEL=$(ls www/*.whl | xargs -n1 basename)
+          echo "PD_WHEEL=$WHEEL" >> "$GITHUB_ENV"
+
+      - name: Assemble the HTTP payload and start the server
+        run: |
+          set -eux
+          mkdir -p www shots
+          cp src/nproot www/nproot
+          cp proto/bin/x86_64/preload/libnproot.so www/libnproot.so
+          # The host-side census runs as a plain static binary -- no
+          # LD_PRELOAD, no linker-namespace or libc-symbol pitfalls.
+          cp proto/bin/x86_64/host-census www/host-census
+          sed "s/@PD_WHEEL@/$PD_WHEEL/g" tests/avd/termux-test.sh > www/avd-test.sh
+          cp "www/$PD_WHEEL" www/ 2>/dev/null || true
+          chmod +x www/nproot www/avd-test.sh
+          ls -l www/
+          nohup python3 -m http.server 8000 --directory "$PWD/www" \
+            > "$PWD/httpd.log" 2>&1 &
+          sleep 1
+          curl -fsSL http://127.0.0.1:8000/avd-test.sh | head -3
+
+      - name: KVM 权限修复与硬件加速确认
+        run: |
+          ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm
+          (sudo apt-get install -y -qq cpu-checker >/dev/null 2>&1 || true)
+          kvm-ok || echo "::warning::kvm-ok 未通过，模拟器可能降级软模拟"
+
+      - name: 启动 AVD 并在 Termux 内执行 nproot 测试
+        uses: ReactiveCircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          avd-name: nproot-avd
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          emulator-options: "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim"
+          script: |
+            adb root; sleep 3; curl -fL --retry 3 -o /tmp/termux.apk "https://github.com/termux/termux-app/releases/download/v0.118.3/$TERMUX_APK" && adb install -r /tmp/termux.apk; adb shell pm grant com.termux android.permission.POST_NOTIFICATIONS 2>/dev/null; adb shell monkey -p com.termux -c android.intent.category.LAUNCHER 1; for i in $(seq 1 60); do adb shell "ls /data/data/com.termux/files/usr/bin/bash" >/dev/null 2>&1 && break; sleep 5; done; adb shell test -f /data/data/com.termux/files/usr/bin/bash || { echo "::error::Termux bootstrap 未完成"; adb exec-out screencap -p > shots/01-bootstrap-fail.png; exit 1; }; sleep 5; adb shell input text 'echo%sok'; adb shell input keyevent 66; sleep 2; for i in 1 2 3; do adb shell input text 'curl%s-fsSL%shttp://10.0.2.2:8000/avd-test.sh%s-o%savd-test.sh'; adb shell input keyevent 66; sleep 12; adb shell test -f /data/data/com.termux/files/home/avd-test.sh && break; done; adb shell test -f /data/data/com.termux/files/home/avd-test.sh || { echo "::error::curl 键入未生效"; adb exec-out screencap -p > shots/03-typing-fail.png; exit 1; }; adb exec-out screencap -p > shots/02-test-started.png; adb shell input text 'bash%savd-test.sh'; adb shell input keyevent 66; for i in $(seq 1 150); do adb shell "grep -q AVD-TEST-DONE /data/data/com.termux/files/home/avd-out.txt 2>/dev/null" && break; sleep 10; done; sleep 5; adb exec-out screencap -p > shots/04-final.png; adb shell "dmesg 2>/dev/null | grep -iE 'seccomp|audit' | tail -150" > shots/dmesg-seccomp.txt 2>/dev/null; adb shell "logcat -d 2>/dev/null | grep -iE 'sigsys|seccomp|has died|Fatal signal' | tail -120" > shots/logcat-seccomp.txt 2>/dev/null; adb shell dmesg > shots/dmesg-full.txt 2>/dev/null; adb pull /data/data/com.termux/files/home/avd-out.txt shots/avd-out.txt; adb pull /data/data/com.termux/files/home/direct.strace shots/direct.strace 2>/dev/null || true; adb pull /data/data/com.termux/files/home/scripted.strace shots/scripted.strace 2>/dev/null || true && adb shell "grep -q AVD-TEST-DONE /data/data/com.termux/files/home/avd-out.txt" || { echo "::error::测试未在时限内结束（看 artifact 截图与部分日志）"; exit 1; }
+
+      - name: 上传日志与截图（15 天过期）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avd-nproot-evidence
+          path: shots/
+          retention-days: 15
+          if-no-files-found: warn
+      - name: 解析判定并写入 Summary
+        if: always()
+        run: |
+          OUT=shots/avd-out.txt
+          if [ ! -f "$OUT" ]; then
+            echo "::error::avd-out.txt 未拉回，测试中断"
+            exit 1
+          fi
+          {
+            echo "## AVD 实机测试结果"
+            echo
+            echo '```'
+            grep -E "census:|SCRIPTED_OK|SCRIPTED_RC=|PTY_RC=|seccomp trap|guard cannot" "$OUT" || true
+            echo '```'
+            if [ -s shots/dmesg-seccomp.txt ]; then
+              echo
+              echo "### 内核 seccomp 记录（dmesg，KILL vs TRAP 的决定性证据）"
+              echo
+              echo '```'
+              grep -iE "seccomp" shots/dmesg-seccomp.txt | tail -40 || true
+              echo '```'
+            else
+              echo
+              echo "> dmesg 未取到 seccomp/audit 记录（内核可能未开 audit）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 机器判定 = DIRECT 探针（纯 nproot 链，不含 python）：
+          # SCRIPTED 探针走 python exec 链，在 x86_64 AVD 上会被
+          # bionic 的 legacy fork(57) 拦截挡死（CPython 自身的 spawn
+          # 路径，nproot 无法干预）；真机 arm64 无此号，链路正常。
+          DIRECT_RC=$(grep -o 'DIRECT_RC=[0-9]*' "$OUT" | tail -1 | cut -d= -f2)
+          echo "DIRECT_RC=$DIRECT_RC"
+          if [ "$DIRECT_RC" != "0" ]; then
+            echo "::error::direct nproot 启动退出码 $DIRECT_RC（159=SIGSYS）"
+            exit 1
+          fi
+          grep -q DIRECT-OK "$OUT" || { echo "::error::DIRECT-OK 缺失"; exit 1; }
+          grep -q "seccomp shield: hardened" "$OUT" \
+            || echo "::warning::未见 shield 硬化日志（census 名单为空？）"
+          SCRIPTED_RC=$(grep -o 'SCRIPTED_RC=[0-9]*' "$OUT" | tail -1 | cut -d= -f2)
+          echo "SCRIPTED_RC=$SCRIPTED_RC"
+          if [ "$SCRIPTED_RC" != "0" ]; then
+            echo "::warning::python 链退出码 $SCRIPTED_RC（x86_64 AVD 的 bionic legacy-fork 限制，直链已过则不阻断）"
+          else
+            grep -q SCRIPTED_OK "$OUT" || { echo "::error::SCRIPTED_OK 缺失"; exit 1; }
+          fi
+

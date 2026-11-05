@@ -1,0 +1,491 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# There is no concurrency group on purpose: each commit gets a run of
+# its own, which neither cancels the runs of the previous commits nor
+# waits for them to complete.
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check (${{ matrix.arch }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+            cc: gcc
+            # The 32-bit x86 loader and the -m32 programs of the suite.
+            packages: gcc-multilib
+          - arch: amd64
+            runner: ubuntu-26.04
+            # The compiler of Termux, which may optimize differently.
+            cc: clang
+            packages: gcc-multilib clang
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+            # Unlike GCC, Clang builds the 32-bit ARM loader on arm64.
+            # Termux builds PRoot with Clang too.
+            cc: clang
+            packages: clang
+
+    # Unlike the implicit shell, this one runs with "pipefail": the
+    # status of "make check" isn't lost in the pipe to tee(1).
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gawk gcc libc6-dev libtalloc-dev make \
+            busybox-static diffutils findutils gdb gettext hostname \
+            libcap2-bin procps strace util-linux \
+            ${{ matrix.packages }}
+
+      - name: Build
+        run: make -C src -j"$(nproc)" CC=${{ matrix.cc }}
+
+      - name: Run the test suite
+        run: make -C tests check 2>&1 | tee check.log
+
+      - name: Run the failed tests again, verbosely
+        if: failure() && hashFiles('check.log') != ''
+        run: |
+          sed -n 's/^  CHECK\t\(.*\) FAILED$/\1/p' check.log | sort -u |
+          while read -r name; do
+            for file in "tests/${name}.sh" "tests/${name}.c"; do
+              if [ -e "${file}" ]; then
+                echo "::group::${file}"
+                make -C tests V=1 "check-${file#tests/}" || true
+                echo "::endgroup::"
+              fi
+            done
+          done
+          {
+            echo "### Failed tests"
+            sed -n 's/^  CHECK\t\(.*\) FAILED$/\1/p' check.log | sort -u
+          } >> "$GITHUB_STEP_SUMMARY"
+          # annotation: readable through the check-runs API without
+          # log access
+          LIST=$(sed -n 's/^  CHECK\t\(.*\) FAILED$/\1/p' check.log | sort -u | tr '\n' ' ')
+          echo "::error title=failed-tests::$LIST"
+
+  proto:
+    name: proto backend e2e (no ptrace)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        # musl-tools provides musl-gcc, needed for the musl-family shim
+        # that gets embedded next to the glibc one.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libtalloc-dev make musl-tools curl
+
+      - name: Build with both shims embedded
+        run: |
+          set -eux
+          make -C src -j"$(nproc)" EMBED_SHIM=both MUSL_CC=musl-gcc \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src"
+          file src/nproot
+
+      - name: Fetch guest rootfsen (glibc + musl)
+        run: |
+          set -eux
+          mkdir -p /tmp/ufs/ubuntu /tmp/ufs/alpine
+          curl -sL -o /tmp/ubuntu.tgz https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-amd64.tar.gz
+          curl -sL -o /tmp/alpine.tgz https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.3-x86_64.tar.gz
+          tar -xzf /tmp/ubuntu.tgz -C /tmp/ufs/ubuntu
+          tar -xzf /tmp/alpine.tgz -C /tmp/ufs/alpine
+
+      - name: proto backend, no shim files on disk (embedded extraction)
+        run: |
+          set -eux
+          export PROOT_TMP_DIR="$RUNNER_TEMP/proot-tmp"
+          mkdir -p "$PROOT_TMP_DIR"
+          # glibc guest: isolation, chained exec, /proc passthrough
+          src/nproot -r /tmp/ufs/ubuntu /bin/ls / >/dev/null
+          test "$(src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'head -1 /etc/os-release')" = 'PRETTY_NAME="Ubuntu 22.04 LTS"'
+          src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'grep -q "^ID=ubuntu" /etc/os-release'
+          test "$(src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'awk "/^TracerPid/{print \$2}" /proc/self/status')" = 0
+          # fake root
+          test "$(src/nproot -0 -r /tmp/ufs/ubuntu /usr/bin/id -u)" = 0
+          # explicit binding
+          echo bind-data > "$RUNNER_TEMP/bind-src.txt"
+          test "$(src/nproot -r /tmp/ufs/ubuntu -b "$RUNNER_TEMP":/mnt/h /bin/cat /mnt/h/bind-src.txt)" = bind-data
+          # ptrace backend still there, and actually tracing
+          test "$(NPROOT_BACKEND=ptrace src/nproot -r /tmp/ufs/ubuntu -b /proc /bin/sh -c 'awk "/^TracerPid/{print \$2}" /proc/self/status')" != 0
+          ls "$PROOT_TMP_DIR"/nproot-shim-glibc-*.so >/dev/null
+          # glibc depth: bash startup + the C++ runtime of apt; on
+          # Android this is where the seccomp guard carries the guest
+          test "$(src/nproot -r /tmp/ufs/ubuntu /bin/bash -c 'echo glibc-bash-ok')" = glibc-bash-ok
+          src/nproot -r /tmp/ufs/ubuntu /usr/bin/apt-get --version | head -1 | grep -q "^apt 2"
+          # host environment isolation (Phase 1.3): distro-standard guest
+          # PATH whatever the invoking shell had, no host TMPDIR, and
+          # NPROOT_KEEP_ENV=1 as the escape hatch
+          test "$(PATH=/data/data/com.termux/files/usr/bin:/opt/host-only src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'echo $PATH')" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          test -z "$(TMPDIR=/data/data/com.termux/files/usr/tmp src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'echo $TMPDIR')"
+          test "$(NPROOT_KEEP_ENV=1 PATH=/opt/host-only src/nproot -r /tmp/ufs/ubuntu /bin/sh -c 'echo $PATH')" = /opt/host-only
+
+      - name: musl guest through the embedded musl shim
+        run: |
+          set -eux
+          export PROOT_TMP_DIR="$RUNNER_TEMP/proot-tmp"
+          src/nproot -r /tmp/ufs/alpine /bin/ls / >/dev/null
+          src/nproot -r /tmp/ufs/alpine /bin/sh -c 'grep -q "^ID=alpine" /etc/os-release'
+          test "$(src/nproot -r /tmp/ufs/alpine /bin/sh -c 'awk "/^TracerPid/{print \$2}" /proc/self/status')" = 0
+          test "$(src/nproot -0 -r /tmp/ufs/alpine /usr/bin/id -u)" = 0
+          # a host (glibc) binary reached from a musl guest must run
+          # natively, never through the musl loader (bionic binaries on
+          # Android rely on the same rule; rerouting them used to end
+          # in relocation errors)
+          test "$(src/nproot -r /tmp/ufs/alpine -b /bin:/host-bin /bin/sh -c '/host-bin/echo host-native-ok')" = host-native-ok
+          # same isolation for the musl guest (the "apt in Alpine" fix)
+          test "$(PATH=/data/data/com.termux/files/usr/bin src/nproot -r /tmp/ufs/alpine /bin/sh -c 'echo $PATH')" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+      - name: Android seccomp simulation (clone3 TRAP must not kill glibc)
+        # The app seccomp filter Android installs in Termux answers
+        # clone3(2) with SECCOMP_RET_TRAP -> SIGSYS, which used to kill
+        # every threaded glibc guest ("Unknown signal 31").  Simulate
+        # the filter with a tiny BPF helper and assert the shim's
+        # SIGSYS -> ENOSYS guard keeps a threaded glibc guest alive.
+        run: |
+          set -eux
+          cat > /tmp/traphelper.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <stddef.h>
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <linux/audit.h>
+          #include <linux/filter.h>
+          #include <linux/seccomp.h>
+          #include <sys/prctl.h>
+          #include <sys/syscall.h>
+
+          static int install_filter(struct sock_fprog *prog)
+          {
+                if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, prog) == 0)
+                        return 0;
+                if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+                        return -1;
+                return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog, 0, 0);
+          }
+
+          int main(int argc, char **argv)
+          {
+                struct sock_filter filter[] = {
+                        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                 offsetof(struct seccomp_data, nr)),
+                        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 435 /* clone3 */, 0, 1),
+                        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+                        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+                };
+                struct sock_fprog prog = {
+                        .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+                        .filter = filter,
+                };
+
+                if (argc < 2)
+                        return 2;
+                if (install_filter(&prog) != 0) {
+                        perror("seccomp");
+                        return 2;
+                }
+                execvp(argv[1], argv + 1);
+                perror("execvp");
+                return 3;
+          }
+          EOF
+          cat > /tmp/t-seccomp.c <<'EOF'
+          #include <pthread.h>
+          #include <stdio.h>
+
+          static void *spin(void *arg) { (void)arg; return NULL; }
+
+          int main(void)
+          {
+                pthread_t t;
+
+                if (pthread_create(&t, NULL, spin, NULL) != 0) {
+                        puts("thread-create-failed");
+                        return 1;
+                }
+                pthread_join(t, NULL);
+                puts("seccomp-guard-ok");
+                return 0;
+          }
+          EOF
+          gcc -O2 -o /tmp/traphelper /tmp/traphelper.c
+          gcc -O2 -pthread -o /tmp/t-seccomp /tmp/t-seccomp.c
+          cp /tmp/t-seccomp /tmp/ufs/ubuntu/bin/t-seccomp
+          # control: without the filter the threaded guest simply works
+          src/nproot -r /tmp/ufs/ubuntu /bin/t-seccomp
+          # with the clone3-killing filter the guard must emulate ENOSYS
+          # debug first: the patch/trap lines explain any regression
+          NPROOT_DEBUG=1 /tmp/traphelper src/nproot -r /tmp/ufs/ubuntu /bin/t-seccomp || echo "traphelper-debug-rc=$?"
+          test "$(/tmp/traphelper src/nproot -r /tmp/ufs/ubuntu /bin/t-seccomp)" = "seccomp-guard-ok"
+          rm -f /tmp/ufs/ubuntu/bin/t-seccomp
+
+      - name: Android app-filter simulation (the full danger list)
+        # The app policy TRAPs every syscall outside bionic's set.  For
+        # a glibc guest the lethal probes are set_robust_list (issued
+        # by the guest loader itself, before any constructor -- the
+        # launcher patches it out of loader+libc copies, forced here
+        # with NPROOT_SECCOMP_COMPAT=1), rseq (GLIBC_TUNABLES), clone3
+        # (shim instruction patch) and close_range/openat2/faccessat2
+        # (shim SIGSYS -> ENOSYS).  The filter is installed by a
+        # guest-side helper so the host binary stays outside it --
+        # exactly the Termux device topology.
+        run: |
+          set -eux
+          cat > /tmp/androidsim.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <stddef.h>
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <linux/audit.h>
+          #include <linux/filter.h>
+          #include <linux/seccomp.h>
+          #include <sys/prctl.h>
+          #include <sys/syscall.h>
+
+          static int install_filter(struct sock_fprog *prog)
+          {
+                if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, prog) == 0)
+                  return 0;
+                if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+                  return -1;
+                return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog, 0, 0);
+          }
+
+          int main(int argc, char **argv)
+          {
+                static const unsigned long nrs[] = {
+                  SYS_set_robust_list, SYS_rseq, SYS_clone3,
+                  SYS_close_range, SYS_openat2, SYS_faccessat2,
+                };
+                struct sock_filter filter[3 + sizeof(nrs) / sizeof(nrs[0])];
+                unsigned long i;
+                int flen = 0;
+                struct sock_fprog prog;
+
+                if (argc < 2)
+                  return 2;
+                filter[flen++] = (struct sock_filter)BPF_STMT(
+                  BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+                for (i = 0; i < sizeof(nrs) / sizeof(nrs[0]); i++) {
+                  int jt = (int)(sizeof(nrs) / sizeof(nrs[0]) - i - 1);
+                  int jf = (i == sizeof(nrs) / sizeof(nrs[0]) - 1) ? 1 : 0;
+
+                  filter[flen++] = (struct sock_filter)BPF_JUMP(
+                    BPF_JMP | BPF_JEQ | BPF_K, nrs[i], jt, jf);
+                }
+                filter[flen++] = (struct sock_filter)BPF_STMT(
+                  BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+                filter[flen++] = (struct sock_filter)BPF_STMT(
+                  BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+                prog.len = (unsigned short)flen;
+                prog.filter = filter;
+                if (install_filter(&prog) != 0) {
+                  perror("seccomp");
+                  return 2;
+                }
+                execvp(argv[1], argv + 1);
+                perror("execvp");
+                return 3;
+          }
+          EOF
+          gcc -O2 -o /tmp/androidsim /tmp/androidsim.c
+          cp /tmp/androidsim /tmp/ufs/ubuntu/bin/t8sim
+          test "$(env NPROOT_SECCOMP_COMPAT=1 src/nproot -r /tmp/ufs/ubuntu -- /bin/t8sim /bin/bash -c 'echo full-filter-ok' 2>/tmp/t8b.err)" = "full-filter-ok"
+          grep -q 'Android seccomp' /tmp/t8b.err
+          rm -f /tmp/ufs/ubuntu/bin/t8sim
+
+  android-app-policy:
+    name: Android app seccomp policy, enforced natively (arm64)
+    # A real enforcing filter over the AOSP app allowlist, installed
+    # around the whole container exactly like zygote does on a phone.
+    # qemu-user cannot forward seccomp, so this must run on a native
+    # arm64 runner; the guest binaries are then plain aarch64 code.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        # clang: on arm64 only clang can build the 32-bit ARM loader
+        # of the ptrace backend (gcc-aarch64 has no -m32 multilib).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libtalloc-dev make curl
+
+      - name: Build
+        run: |
+          set -eux
+          make -C src -j"$(nproc)" CC=clang EMBED_SHIM=glibc \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src"
+          make -C proto preload/libnproot.so
+          # static: the helper runs inside the guest whose libc is older
+          # than the runner's -- dynamic linking would pick up the
+          # patched copy first on LD_LIBRARY_PATH and miss new symbol
+          # versions
+          cc -O2 -static -o /tmp/ginstall proto/census/ginstall.c
+          file src/nproot /tmp/ginstall
+
+      - name: Fetch an aarch64 glibc rootfs
+        run: |
+          set -eux
+          mkdir -p /tmp/ufs/ubuntu
+          curl -sL -o /tmp/ubuntu.tgz https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz
+          tar -xzf /tmp/ubuntu.tgz -C /tmp/ufs/ubuntu
+          test -x /tmp/ufs/ubuntu/bin/bash
+
+      - name: The filter bites -- a bare guest must die by SIGSYS
+        run: |
+          set -eux
+          set +e
+          /tmp/ginstall --policy proto/census/policies/android12-arm64.txt \
+            --mode strict -- /tmp/ufs/ubuntu/bin/bash -c 'echo must-not-print'
+          rc=$?
+          set -e
+          # 128+31: killed by SIGSYS, exactly the device's "Unknown
+          # signal 31"
+          test "$rc" -eq 159 || test "$rc" -eq 132
+
+      # The policy file is passed as a HOST path: the helper is
+          # statically linked (no shim inside it to translate guest
+          # paths).
+          # Device topology: zygote's filter wraps everything the app
+      # process runs, while the nproot binary itself is bionic there
+      # and stays outside the policy.  On the runner nproot is a glibc
+      # binary, so the filter helper must run INSIDE the container
+      # (as its init command), never around nproot.
+      - name: Set up the guest-side policy helper
+        run: |
+          set -eux
+          cp /tmp/ginstall /tmp/ufs/ubuntu/bin/t8pol
+          cp proto/census/policies/android12-arm64.txt /tmp/ufs/ubuntu/tmp/policy12.txt
+          cp proto/census/policies/android15-arm64.txt /tmp/ufs/ubuntu/tmp/policy15.txt
+
+      - name: The shim carries the guest -- full stack survives
+        run: |
+          set -eux
+          export PROOT_TMP_DIR="$RUNNER_TEMP/proot-tmp"
+          mkdir -p "$PROOT_TMP_DIR"
+          out=$(env NPROOT_SECCOMP_COMPAT=1 NPROOT_DEBUG=1 \
+                PROOT_TMP_DIR="$PROOT_TMP_DIR" \
+                ./src/nproot -r /tmp/ufs/ubuntu -- \
+                /bin/t8pol --policy /tmp/ufs/ubuntu/tmp/policy12.txt --mode strict -- \
+                /bin/bash -c 'echo policy-survivor-$((41+1))' \
+                2>/tmp/policy.err) \
+            || { echo "=== stderr ==="; cat /tmp/policy.err; exit 1; }
+          test "$out" = "policy-survivor-42"
+          grep -q 'seccomp' /tmp/policy.err
+
+      - name: android15 policy (clone3 allowed) also survives
+        run: |
+          set -eux
+          export PROOT_TMP_DIR="$RUNNER_TEMP/proot-tmp"
+          out=$(env NPROOT_SECCOMP_COMPAT=1 \
+                PROOT_TMP_DIR="$PROOT_TMP_DIR" \
+                ./src/nproot -r /tmp/ufs/ubuntu -- \
+                /bin/t8pol --policy /tmp/ufs/ubuntu/tmp/policy15.txt --mode strict -- \
+                /bin/bash -c 'echo a15-survivor' 2>/tmp/policy15.err) \
+            || { echo "=== stderr ==="; cat /tmp/policy15.err; exit 1; }
+          test "$out" = "a15-survivor"
+
+      - name: kill-on-exit reaps orphans under the policy
+        run: |
+          set -eux
+          export PROOT_TMP_DIR="$RUNNER_TEMP/proot-tmp"
+          env NPROOT_SECCOMP_COMPAT=1 \
+              PROOT_TMP_DIR="$PROOT_TMP_DIR" \
+              ./src/nproot -r /tmp/ufs/ubuntu --kill-on-exit -- \
+              /bin/t8pol --policy /tmp/ufs/ubuntu/tmp/policy12.txt --mode strict -- \
+              /bin/bash -c 'nohup sleep 300 >/dev/null 2>&1 & exit 0'
+          sleep 1
+          if pgrep -f 'sleep 300' >/dev/null; then
+            echo "orphan survived --kill-on-exit" >&2
+            exit 1
+          fi
+
+      # The device death: a blocked syscall issued inside glibc's
+      # all-signals-blocked fork/posix_spawn window -- force_sig()
+      # resets the SIGSYS disposition, the mask restore delivers it,
+      # the guest dies with rc 159 and no handler log.  The census-
+      # driven shield hardens the guest libc's own stubs instead, so
+      # the blocked syscalls return -ENOSYS without any signal.
+      - name: The shield saves the blocked-mask window (TRAP and KILL)
+        run: |
+          set -eux
+          uname -r
+          cc -O2 -o /tmp/filter_parent proto/census/filter_parent.c
+          cc -O2 -o /tmp/stub_probe proto/census/stub_probe.c
+          mkdir -p /tmp/shield-rootfs/bin /tmp/shield-tmp
+          cp /tmp/stub_probe /tmp/shield-rootfs/bin/
+          # Sentinel: does this environment enforce a user-installed
+          # KILL filter at all?  Some CI kernels nullify it (observed:
+          # the TRAP'd getppid returned a real pid) -- the unit test is
+          # vacuous there; the real verification runs on the AVD job.
+          set +e
+          /tmp/filter_parent kill=105 -- /tmp/stub_probe uid
+          krc=$?
+          set -e
+          if [ "$krc" -ne 159 ]; then
+            echo "::warning::user seccomp KILL not enforced here (rc=$krc) -- skipping the shield unit test"
+            exit 0
+          fi
+          # without the shim the blocked-mask window kills (159) on
+          # kernels that reset the disposition; newer kernels may
+          # deliver the pending SIGSYS harmlessly -- both are fine, the
+          # KILL above is what must never be survivable bare
+          set +e
+          /tmp/filter_parent trap=110 kill=105 -- /tmp/stub_probe
+          rc=$?
+          set -e
+          echo "bare probe rc=$rc"
+          # with the shim the census-driven shield hardens the stubs:
+          # both syscalls return -ENOSYS, no signal, no death
+          out=$(env LD_PRELOAD="$PWD/proto/preload/libnproot.so" \
+                NPROOT_ROOT=/tmp/shield-rootfs NPROOT_SHIELD=1 \
+                PROOT_TMP_DIR=/tmp/shield-tmp \
+                /tmp/filter_parent trap=110 kill=105 -- \
+                /tmp/shield-rootfs/bin/stub_probe 2>/tmp/shield.err) \
+            || { echo "=== shield stderr ==="; cat /tmp/shield.err; exit 1; }
+          echo "$out" | grep -q ALIVE
+          echo "$out" | grep -q 'getppid -> -38'
+          grep -q 'seccomp shield: hardened' /tmp/shield.err
+          test "$(head -c 2 /tmp/shield-tmp/nproot-seccomp-v1-*)" = "v1"

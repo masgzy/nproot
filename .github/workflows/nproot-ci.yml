@@ -1,0 +1,246 @@
+name: nproot CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-ndk:
+    name: android (aarch64, bionic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Show NDK
+        run: |
+          echo "NDK: ${ANDROID_NDK_LATEST_HOME}"
+          ls "${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head -5
+
+      - name: Build talloc for Android
+        run: |
+          set -eux
+          # Outage-proof fetch: www.samba.org has served truncated
+          # bodies and 504s; the helper walks the mirrors and checks
+          # the published sha256 before handing the tarball over.
+          sh build-aux/fetch-talloc.sh
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          # The generated version script marks _end/_edata/__bss_start as
+          # local; these symbols do not exist yet at link time and lld
+          # (unlike GNU ld) errors out.  Stop emitting them, and keep
+          # --undefined-version as a belt-and-suspenders for the linker.
+          sed -i 's/local_abi.extend(\["!_end", "!__bss_start", "!_edata"\])//' \
+              buildtools/wafsamba/samba_abi.py
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          LD="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          LDFLAGS="-Wl,--undefined-version" \
+          ./configure --prefix="$PWD/../talloc-out" --cross-compile \
+                      --cross-answers="$GITHUB_WORKSPACE/build-aux/talloc-answers.txt" \
+                      --disable-python --disable-rpath --without-gettext
+          make -j"$(nproc)"
+          make install
+          # Archive the just-built objects into a static library so
+          # nproot can link talloc in and be self-contained.  Only
+          # talloc.o goes in, exactly like Termux's own libtalloc
+          # package does on Android (bionic needs none of lib/replace);
+          # llvm-ar, not host ar: the objects are aarch64 ELF.
+          ARBIN="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rm -f ../talloc-out/lib/libtalloc.a
+          "$ARBIN/llvm-ar" rcs ../talloc-out/lib/libtalloc.a \
+              bin/default/talloc.c*.o
+
+      - name: Build nproot (talloc statically linked)
+        run: |
+          set -eux
+          BIN="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          make -C src -j"$(nproc)" \
+            CC="$BIN/aarch64-linux-android24-clang" \
+            STRIP="$BIN/llvm-strip" OBJCOPY="$BIN/llvm-objcopy" OBJDUMP="$BIN/llvm-objdump" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            TALLOC_LINK="$PWD/talloc-out/lib/libtalloc.a" \
+            LDFLAGS="-Wl,-z,noexecstack"
+          file src/nproot
+          # The artifact must be self-contained: Android's dynamic
+          # linker never searches the executable's own directory, so a
+          # libtalloc.so.2 shipped beside it went unnoticed and nproot
+          # failed to start with "library libtalloc.so.2 not found".
+          if "$BIN/llvm-readelf" -d src/nproot | grep -q libtalloc; then
+            echo "nproot still dynamically depends on talloc" >&2
+            exit 1
+          fi
+
+      - name: Smoke test on host is impossible for bionic; verify the artifact
+        run: |
+          test -x src/nproot
+          test -x src/loader/loader || true
+
+      - name: Build the preload shims for the proto backend
+        # One shim per guest libc family, built against the guest libc
+        # (not bionic): zig cc carries both sysroots.  16 KiB max-page
+        # keeps them loadable on 4K and 16K page devices alike.
+        run: |
+          set -eux
+          pip install ziglang
+          Z="python3 -m ziglang cc"
+          ZFLAGS="-O2 -Wall -Wextra -Wl,-z,max-page-size=16384 -Wl,-z,noexecstack"
+          mkdir -p shim-out/preload
+          $Z -target aarch64-linux-gnu $ZFLAGS -fPIC -shared \
+            -DNPROOT_PATCH_SYSCALLS=1 \
+            -o shim-out/preload/libnproot.so proto/preload/nproot_preload.c -ldl
+          $Z -target aarch64-linux-musl -dynamic $ZFLAGS -fPIC -shared \
+            -o shim-out/preload/libnproot-musl.so proto/preload/nproot_preload.c -ldl
+          # Standalone seccomp census: a static binary any Android
+          # linker namespace accepts; run it in a plain Termux shell to
+          # dump the device's real filter (see proto/ANDROID.md).
+          $Z -target aarch64-linux-musl $ZFLAGS -static \
+            -o shim-out/host-census proto/census/host_census.c
+          file shim-out/preload/*.so
+          cp src/nproot shim-out/nproot
+          # Artifact freshness assertions: a defense-less shim or a
+          # launcher without the Android seccomp compatibility layer is
+          # exactly what "Unknown signal 31" device reports were made
+          # of -- never ship one again.
+          strings shim-out/preload/libnproot.so | grep -q 'seccomp trap'
+          strings shim-out/preload/libnproot-musl.so | grep -q 'seccomp trap'
+          strings shim-out/nproot | grep -q 'Android seccomp'
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nproot-android-arm64
+          # The ptrace loader ships embedded in the binary (single
+          # file); the proto backend shims ship beside it in preload/,
+          # where the runtime lookup finds them.
+          path: |
+            shim-out/nproot
+            shim-out/host-census
+            shim-out/preload/libnproot.so
+            shim-out/preload/libnproot-musl.so
+
+  musl-static:
+    name: musl (x86_64, static)
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-alpine
+    timeout-minutes: 30
+    steps:
+      - name: Install toolchain
+        # bsd-compat-headers provides sys/queue.h, which musl lacks but
+        # tracee.h needs (same package Alpine's own proot build uses).
+        run: apk add --no-cache build-base make python3 git file linux-headers bsd-compat-headers
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Make git describe work in the container
+        # Container jobs run as root while the workspace is owned by
+        # the runner user; without safe.directory git describe fails
+        # silently and build.h falls back to VERSION "5.1.0" instead
+        # of the commit hash.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build talloc (native musl)
+        run: |
+          set -eux
+          sh build-aux/fetch-talloc.sh
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          ./configure --prefix="$PWD/../talloc-out" --disable-python --disable-rpath
+          make -j"$(nproc)"
+          make install
+          # talloc's Waf setup doesn't build static libraries, so do it
+          # manually, exactly like Alpine's own talloc package does:
+          # the -static nproot link below needs libtalloc.a.
+          ar qf "$PWD/../talloc-out/lib/libtalloc.a" \
+              bin/default/talloc.c*.o \
+              bin/default/lib/replace/replace.c*.o
+
+      - name: Build nproot (static)
+        run: |
+          set -eux
+          make -C src -j"$(nproc)" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            LDFLAGS="-L$PWD/talloc-out/lib -static -ltalloc -Wl,-z,noexecstack"
+          file src/nproot || true
+          # Alpine's gcc defaults to PIE, so this is a static PIE and
+          # file(1) may not say "statically linked"; assert through the
+          # dynamic section instead: a static binary has no DT_NEEDED.
+          if readelf -d src/nproot | grep -q NEEDED; then
+            echo "nproot is not statically linked" >&2
+            exit 1
+          fi
+
+      - name: Backend demos (host tests inside the container)
+        run: make -C src/backend check
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nproot-musl-x86_64-static
+          path: src/nproot
+
+  termux-arm64:
+    name: termux (docker arm64)
+    runs-on: ubuntu-24.04-arm
+    needs: [android-ndk]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: nproot-android-arm64
+          path: artifact
+
+      - name: Run the regression suite in a real Termux container
+        run: |
+          set -eux
+          chmod +x artifact/nproot
+          # Same describe command as the build, so a future tag keeps
+          # the assertion valid. Computed before anything touches the
+          # tree (a chmod on a tracked file would append -dirty and
+          # break the comparison against the binary's embedded hash).
+          EXPECTED_HASH="$(git describe --tags --dirty --abbrev=8 --always)"
+          # /tmp is mounted read-only: the CI-side equivalent of the
+          # Android layout nproot must cope with. Everything else is
+          # the untouched Termux userland from the official image.
+          # T8 inside the script exercises the proto (no-ptrace) backend
+          # against an Alpine rootfs downloaded into the container home.
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/work:ro" \
+            -e EXPECTED_HASH="$EXPECTED_HASH" \
+            --tmpfs /tmp:ro \
+            --entrypoint /data/data/com.termux/files/usr/bin/bash \
+            termux/termux-docker:aarch64 /work/tests/termux-docker-test.sh
+
+  spike:
+    name: spike probes (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run feasibility probes
+        run: make -C spike check
+
+      - name: Backend demos
+        run: make -C src/backend check
