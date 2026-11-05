@@ -95,6 +95,7 @@ set +e
 PDCMD=$(pdi18n login debian --get-proot-cmd)
 echo "PDCMD: $PDCMD"
 # pure bash surgery: sed's backslashes die through the quoting layers
+NEWLINE=$'\n'
 OLD="-i \\"
 NEW="-i PROOT_VERBOSE=2 NPROOT_DEBUG=1 NPROOT_CENSUS=1 \\"
 PDCMD_DEBUG=${PDCMD/"$OLD"/"$NEW"}
@@ -113,11 +114,17 @@ if command -v strace >/dev/null 2>&1; then
                 sh -c "$PDCMD_DEBUG -- /bin/bash -lc 'echo DIRECT-OK'"
         echo "DIRECT_STRACE_RC=$?"
 fi
-# same clean command shape as the scripted probe: bash -l -- makes
-# bash exec /bin/bash again, an edge of its own not worth chasing
-# while the pure-nproot chain is what this probe exists to verify
-sh -c "$PDCMD_DEBUG -- /bin/bash -lc \
-        'echo DIRECT-OK; uname -m; id -u; cat /etc/debian_version'"
+# fold the appended command INTO the guest bash so there is exactly
+# one bash: pd's base command ends with "/bin/bash \\\n  -l" and the
+# appended '-- /bin/bash -lc ...' made it a double bash, whose second
+# exec trips the ENOEXEC edge.  Replacing the '/bin/bash + -l' tail
+# with a single 'bash -lc ...' gives the same clean shape the
+# scripted probe already proves works.
+# strip from the trailing "/bin/bash \<newline>  -l" to the end, then
+# append the single clean command
+PDCMD_DEBUG=${PDCMD_DEBUG%"/bin/bash \\"*}"  /bin/bash -lc 'echo DIRECT-OK; uname -m; id -u; cat /etc/debian_version'"
+echo "PDCMD_SINGLE: $PDCMD_DEBUG"
+sh -c "$PDCMD_DEBUG"
 echo "DIRECT_RC=$?"
 set -e
 
