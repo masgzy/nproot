@@ -80,6 +80,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <spawn.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -349,6 +350,23 @@ static int      (*real_renameat2)(int, const char *, int, const char *, unsigned
 static int      (*real_faccessat2)(int, const char *, int, int);
 #endif
 
+/* process-creation family: glibc blocks ALL signals around the
+ * internal clone(2) of fork/posix_spawn, and a seccomp trap delivered
+ * in that window is force_sig()ed to SIG_DFL -- the guest dies with
+ * signal 31 and the SIGSYS handler never logs anything.  Interposing
+ * the entry points lets the debug log bracket the window, so a silent
+ * death between "window enter" and "window exit" immediately narrows
+ * the killer syscall to the fork/spawn internals. */
+static pid_t    (*real_fork)(void);
+static int      (*real_posix_spawn)(pid_t *, const char *,
+                                const posix_spawn_file_actions_t *,
+                                const posix_spawnattr_t *,
+                                char *const [], char *const []);
+static int      (*real_posix_spawnp)(pid_t *, const char *,
+                                const posix_spawn_file_actions_t *,
+                                const posix_spawnattr_t *,
+                                char *const [], char *const []);
+
 static void init_real_all(void)
 {
         real_open = dlsym(RTLD_NEXT, "open");
@@ -417,6 +435,9 @@ static void init_real_all(void)
         real_renameat2 = dlsym(RTLD_NEXT, "renameat2");
         real_faccessat2 = dlsym(RTLD_NEXT, "faccessat2");
 #endif
+        real_fork = dlsym(RTLD_NEXT, "fork");
+        real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
+        real_posix_spawnp = dlsym(RTLD_NEXT, "posix_spawnp");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1089,6 +1110,7 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
 
         for (off = 0; off + 8 <= len; off += 4) {
                 unsigned int ins, nr;
+                int w, svc_w = 0;
 
                 memcpy(&ins, (const void *)(start + off), 4);
                 /* The fixed pattern INCLUDING Rd: syscall numbers go in
@@ -1100,26 +1122,43 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                  * real device (every x8 stub was silently rejected). */
                 if ((ins & 0xFFE0001Fu) != 0xD2800008u)
                         continue;       /* not "movz x8, #imm16" */
-                {
-                        unsigned int nxt;
-
-                        memcpy(&nxt, (const void *)(start + off + 4), 4);
-                        if (nxt != 0xD4000001u)
-                                continue;   /* not "svc #0" */
-                }
                 nr = (ins >> 5) & 0xFFFFu;
                 if (!shield_is_blocked(nr))
                         continue;
-                if (shield_patch_at((void *)(start + off), 8,
-                                    rep, sizeof(rep))) {
+                /* The svc is USUALLY the next word, but compiler
+                 * scheduling may interleave up to a few clobber-free
+                 * instructions between the number load and the svc.
+                 * Search a small window so such stubs are still
+                 * hardened; a stray "movz x8, #imm" that never feeds
+                 * an svc is left alone (windows without svc are not
+                 * patch targets). */
+                for (w = 1; w <= 3; w++) {
+                        unsigned int word;
+
+                        if (off + 4 + 4 * w > len)
+                                break;
+                        memcpy(&word,
+                               (const void *)(start + off + 4 * w), 4);
+                        if (word == 0xD4000001u) {
+                                svc_w = w;
+                                break;  /* "svc #0" found */
+                        }
+                }
+                if (svc_w == 0)
+                        continue;       /* no svc consuming this movz */
+                if (shield_patch_at((void *)(start + off), 4,
+                                    &rep[0], 4) &&
+                    shield_patch_at((void *)(start + off + 4 * svc_w),
+                                    4, &rep[1], 4)) {
                         patched++;
-                        dbg("shield: patched nr=%u stub at %p", nr,
-                            (void *)(start + off));
+                        dbg("shield: patched nr=%u stub at %p "
+                            "(svc +%d)", nr, (void *)(start + off),
+                            svc_w);
                 } else {
                         dbg("shield: mprotect RWX failed at %p",
                             (void *)(start + off));
                 }
-                off += 4;               /* the svc was consumed */
+                off += 4 * svc_w;       /* consumed through the svc */
         }
 #elif defined(__x86_64__)
         /* mov eax, -ENOSYS ; nop ; nop -- same rule: the original
@@ -1281,8 +1320,13 @@ static int shield_harden_maps(void)
                                                 g_shield_scan_ranges++;
                                                 hits = shield_scan_range(start,
                                                                          end);
-                                                if (hits > 0)
-                                                        patched++;
+                                                /* count STUBS, not mappings:
+                                                 * "hardened 3" once meant "3
+                                                 * mappings had hits" while 54
+                                                 * stubs had actually been
+                                                 * patched -- wildly misleading
+                                                 * on a diagnosis log */
+                                                patched += hits;
                                         }
                                 }
                         }
@@ -2607,4 +2651,66 @@ int execvp(const char *file, char *const argv[])
         }
         errno = ENOENT;
         return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* process-creation windows: bracket fork/posix_spawn in the debug log */
+/* ------------------------------------------------------------------ */
+
+/* glibc masks every signal around the clone(2) inside fork() and
+ * posix_spawn(), and force_sig() resets a blocked SIGSYS disposition
+ * to SIG_DFL BEFORE delivering -- a trapped syscall in that window
+ * kills the process silently.  These wrappers add no behavior; they
+ * only mark the window so a death log ends between "window enter" and
+ * "window exit rc=..." and the search narrows to the fork/spawn
+ * internals.  vsnprintf under g_debug is safe here: the guest is
+ * single-threaded at these call sites, so no malloc lock can be held. */
+
+pid_t fork(void)
+{
+        pid_t rc;
+
+        init_real_all_once();
+        if (g_debug)
+                dbg("process window enter: fork");
+        if (real_fork == NULL) {
+                errno = ENOSYS;
+                return -1;
+        }
+        rc = real_fork();
+        if (g_debug)
+                dbg("process window exit: fork rc=%d", (int)rc);
+        return rc;
+}
+
+int posix_spawn(pid_t *pid, const char *path,
+                const posix_spawn_file_actions_t *acts,
+                const posix_spawnattr_t *attr,
+                char *const argv[], char *const envp[])
+{
+        int rc;
+
+        init_real_all_once();
+        if (g_debug)
+                dbg("process window enter: posix_spawn %s", path);
+        rc = real_posix_spawn(pid, path, acts, attr, argv, envp);
+        if (g_debug)
+                dbg("process window exit: posix_spawn rc=%d", rc);
+        return rc;
+}
+
+int posix_spawnp(pid_t *pid, const char *file,
+                 const posix_spawn_file_actions_t *acts,
+                 const posix_spawnattr_t *attr,
+                 char *const argv[], char *const envp[])
+{
+        int rc;
+
+        init_real_all_once();
+        if (g_debug)
+                dbg("process window enter: posix_spawnp %s", file);
+        rc = real_posix_spawnp(pid, file, acts, attr, argv, envp);
+        if (g_debug)
+                dbg("process window exit: posix_spawnp rc=%d", rc);
+        return rc;
 }

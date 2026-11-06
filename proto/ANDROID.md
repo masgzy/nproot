@@ -194,10 +194,18 @@ time ../src/nproot -r ~/rootfs/ubuntu /bin/true # ptrace 后端（若已编译�
   （现已支持从用户环境透传进容器）则每个陷阱都带
   `-> ENOSYS` 后缀；死亡前最后一行就是凶手号，据此可定位。
   紧急逃生门：`NPROOT_BACKEND=ptrace`。
-  **注意**：`bin/aarch64/nproot-lite` 是独立的精简启动器，**不含**
-  该启动器补丁——真机上跑 glibc 发行版请使用 CI 产物的 `nproot`
-  主程序（pd 默认调用的就是它）；nproot-lite 仅用于仓库内
-  原型自测（musl guest 无此问题）。
+  **静默死亡（无 trap 日志）的定位法**：若死亡发生在 fork/
+  posix_spawn 的全信号阻塞窗口，SIGSYS handler 收不到信号、一行
+  trap 日志都不会有——`NPROOT_DEBUG=1` 的日志里看**最后一行**：
+  * 停在 `process window enter: fork/spawn` 且没有对应 exit → 凶手
+    syscall 在该窗口内发出，把 guest libc 副本反汇编里该窗口
+    (glibc `__clone_internal`/`__spawni`) 触及的号与 census 名单
+    对表；
+  * 停在普通输出 → 用 Termux 的 strace 直接抓：`pkg install strace;
+    strace -f -o /sdcard/nproot-strace.log pd sh debian`（strace 在
+    syscall 进入时先打印，死亡前最后一行就是凶手号）；
+  * `hardened N` 的 N 现在是**补丁过的存根条数**（此前误按"有命中
+    的映射数"计数：54 个存根只显示 3，严重误导诊断）；
 * **guest 内执行宿主二进制（如 pd 默认模式把 Termux 前缀放进
   PATH）**：shim 按 PT_INTERP 的 libc 家族守卫——同家族才经 guest
   loader 重路由，异家族（bionic、宿主 glibc）原生直执行，与
@@ -319,3 +327,23 @@ syscall，不存在误匹配。
 CI 的 tests 工作流含此步骤）：TRAP(110)+KILL(105)+全信号阻塞窗口，
 无 shim 必死（159），带 shim 存活且 `getppid()->-38`（与 guard 会
 模拟的值一字不差）。
+
+## 11. 盾牌补丁（2026-11-06）
+
+真机（某 GKI 6.1 arm64 设备）日志复盘发现的三处问题，同日修复：
+
+* **汇总计数错误**：`shield_harden_maps()` 按"有命中的映射数"而非
+  存根数累计——54 个存根被打进日志，汇总行却只显示
+  `hardened 3`，极易把健康状态误读成盾牌失效。现在 `hardened N`
+  就是实际补丁的存根条数。
+* **aarch64 匹配窗口过窄**：只认 `movz x8, #nr` 紧邻 `svc #0` 的
+  桩。编译器调度会在两者之间插入至多几条 clobber 指令，这类桩
+  全部漏网（bash 启动死于信号 31 而 hardened 正常的首选解释）。
+  现在向后搜索 3 条指令内的 `svc #0`，命中即同时补丁装载与 svc
+  两处；窗口内无 svc 的 `movz x8` 不动（无 svc 消费的装载不是
+  syscall 桩）。
+* **静默死亡不可归因**：全信号阻塞窗口内死亡时 handler 一行日志
+  都不写。shim 现已拦截 `fork`/`posix_spawn`/`posix_spawnp` 的
+  PLT 入口，`NPROOT_DEBUG=1` 下用 `process window enter/exit`
+  标记窗口边界——死亡日志停在哪个窗口、凶手范围立刻收窄到对应
+  的 glibc 内部路径。
