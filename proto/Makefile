@@ -15,6 +15,12 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra
 MUSL_CC ?= musl-gcc
 ZIG     ?= zig
+# Same-zip assertion: the shim must carry the same version string as
+# the launcher (which gets it from src/GNUmakefile's build.h, same
+# git describe) so a stale preload/ beside an updated nproot binary
+# is announced loudly at guest startup.
+BUILD_ID := $(shell git describe --tags --dirty --abbrev=8 --always 2>/dev/null || echo unknown)
+BID      := -DNPROOT_BUILD_ID='"$(BUILD_ID)"'
 # 16 KiB max-page-size keeps the aarch64 artifacts loadable on both
 # 4K and 16K page Android devices.
 ZFLAGS  ?= -O2 -Wall -Wextra -s -Wl,-z,max-page-size=16384 -Wl,-z,noexecstack
@@ -22,14 +28,14 @@ ZFLAGS  ?= -O2 -Wall -Wextra -s -Wl,-z,max-page-size=16384 -Wl,-z,noexecstack
 all: preload/libnproot.so launcher/nproot-lite
 
 preload/libnproot.so: preload/nproot_preload.c
-	$(CC) $(CFLAGS) -fPIC -shared -DNPROOT_PATCH_SYSCALLS=1 -o $@ $< -ldl
+	$(CC) $(CFLAGS) -fPIC -shared -DNPROOT_PATCH_SYSCALLS=1 $(BID) -o $@ $< -ldl
 
 launcher/nproot-lite: launcher/nproot-lite.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # The shim interposes guest libc, so a musl guest needs a musl-built shim.
 preload/libnproot-musl.so: preload/nproot_preload.c
-	$(MUSL_CC) $(CFLAGS) -fPIC -shared -o $@ $<
+	$(MUSL_CC) $(CFLAGS) -fPIC -shared $(BID) -o $@ $<
 
 check: all
 	./run-tests.sh
@@ -42,9 +48,10 @@ android:
 	$(ZIG) cc -target aarch64-linux-musl $(ZFLAGS) \
 	    -o bin/aarch64/nproot-lite launcher/nproot-lite.c
 	$(ZIG) cc -target aarch64-linux-gnu $(ZFLAGS) -fPIC -shared \
-	    -DNPROOT_PATCH_SYSCALLS=1 \
+	    -DNPROOT_PATCH_SYSCALLS=1 $(BID) \
 	    -o bin/aarch64/preload/libnproot.so preload/nproot_preload.c -ldl
 	$(ZIG) cc -target aarch64-linux-musl -dynamic $(ZFLAGS) -fPIC -shared \
+	    $(BID) \
 	    -o bin/aarch64/preload/libnproot-musl.so preload/nproot_preload.c -ldl
 	$(ZIG) cc -target aarch64-linux-musl $(ZFLAGS) -static \
 	    -o bin/aarch64/host-census census/host_census.c
@@ -56,9 +63,10 @@ android-x86_64:
 	$(ZIG) cc -target x86_64-linux-musl $(ZFLAGS) \
 	    -o bin/x86_64/nproot-lite launcher/nproot-lite.c
 	$(ZIG) cc -target x86_64-linux-gnu $(ZFLAGS) -fPIC -shared \
-	    -DNPROOT_PATCH_SYSCALLS=1 \
+	    -DNPROOT_PATCH_SYSCALLS=1 $(BID) \
 	    -o bin/x86_64/preload/libnproot.so preload/nproot_preload.c -ldl
 	$(ZIG) cc -target x86_64-linux-musl -dynamic $(ZFLAGS) -fPIC -shared \
+	    $(BID) \
 	    -o bin/x86_64/preload/libnproot-musl.so preload/nproot_preload.c -ldl
 	$(ZIG) cc -target x86_64-linux-musl $(ZFLAGS) -static \
 	    -o bin/x86_64/host-census census/host_census.c

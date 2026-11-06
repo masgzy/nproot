@@ -369,6 +369,7 @@ static int      (*real_posix_spawnp)(pid_t *, const char *,
 static int      (*real_sigprocmask)(int, const sigset_t *, sigset_t *);
 static int      (*real_pthread_sigmask)(int, const sigset_t *,
                                         sigset_t *);
+static long     (*real_syscall)(long, ...);
 
 static void init_real_all(void)
 {
@@ -443,6 +444,7 @@ static void init_real_all(void)
         real_posix_spawnp = dlsym(RTLD_NEXT, "posix_spawnp");
         real_sigprocmask = dlsym(RTLD_NEXT, "sigprocmask");
         real_pthread_sigmask = dlsym(RTLD_NEXT, "pthread_sigmask");
+        real_syscall = dlsym(RTLD_NEXT, "syscall");
 }
 
 /* ------------------------------------------------------------------ */
@@ -540,6 +542,18 @@ extern void nproot_sigreturn_stub(void);
 
 #define KSA_SIGINFO  4ul
 #define KSA_RESTORER 0x04000000ul
+/* SA_NODEFER: while the emulate handler runs, SIGSYS must stay
+ * DELIVERABLE.  Without it the kernel blocks SIGSYS for the handler's
+ * duration, and a blocked syscall issued from within the handler (a
+ * nested trap) is force_sig()ed with SIGSYS blocked -- the handler is
+ * reset to SIG_DFL and the process dies on the spot with no log.  The
+ * handler only touches the ucontext and does one raw write, so
+ * re-entry is safe. */
+#define KSA_NODEFER  0x40000000ul
+
+#ifndef NPROOT_BUILD_ID
+#define NPROOT_BUILD_ID ""
+#endif
 
 static int ksigaction(int nr, void *handler, unsigned long flags)
 {
@@ -561,6 +575,8 @@ static int ksigaction(int nr, void *handler, unsigned long flags)
                     sizeof(unsigned long));
         return r < 0 ? (int)r : 0;
 }
+
+static void nproot_unblock_sigsys(void);
 
 static void seccomp_sigsys_emulate(int signum, siginfo_t *si, void *uctx)
 {
@@ -1059,6 +1075,11 @@ static int census_sweep(int *blocked, int blocked_max, int *p_nb,
 /* ------------------------------------------------------------------ */
 #define NPROOT_SHIELD_MAX_NR 512
 static unsigned char g_shield_blocked[(NPROOT_SHIELD_MAX_NR + 7) / 8];
+/* Set once a verified census list has been marked: gates the generic
+ * syscall() door below (the census probes themselves go through that
+ * door and must keep trapping, so the door only closes AFTER the
+ * census is done). */
+static volatile int g_shield_armed;
 
 static void shield_mark(const int *nrs, int n)
 {
@@ -1068,6 +1089,8 @@ static void shield_mark(const int *nrs, int n)
                 if (nrs[i] >= 0 && nrs[i] < NPROOT_SHIELD_MAX_NR)
                         g_shield_blocked[nrs[i] >> 3] |=
                                 (unsigned char)(1u << (nrs[i] & 7));
+        if (n > 0)
+                __atomic_store_n(&g_shield_armed, 1, __ATOMIC_RELEASE);
 }
 
 static int shield_is_blocked(unsigned nr)
@@ -1131,9 +1154,10 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                  * INTERNAL_SYSCALL -- emit the 32-bit form "movz w8,
                  * #nr" (0x52800008) instead; W8 zero-extends into X8
                  * before the svc, so the kernel sees the same number.
-                 * On the device log faccessat2 (nr 439) sat
-                 * blocked-but-unpatched for exactly this reason while
-                 * 58 X8-form stubs were hardened.  Accept both. */
+                 * On the real-device log that motivated this matcher,
+                 * faccessat2 (nr 439) sat blocked-but-unpatched for
+                 * exactly this reason while 58 X8-form stubs were
+                 * hardened.  Accept both. */
                 if ((ins & 0xFFE0001Fu) != 0xD2800008u &&
                     (ins & 0xFFE0001Fu) != 0x52800008u)
                         continue;       /* not "movz x8/w8, #imm16" */
@@ -1141,13 +1165,17 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 if (!shield_is_blocked(nr))
                         continue;
                 /* The svc is USUALLY the next word, but compiler
-                 * scheduling may interleave up to a few clobber-free
-                 * instructions between the number load and the svc.
-                 * Search a small window so such stubs are still
-                 * hardened; a stray "movz x8, #imm" that never feeds
-                 * an svc is left alone (windows without svc are not
-                 * patch targets). */
-                for (w = 1; w <= 3; w++) {
+                 * scheduling may interleave clobber-free instructions
+                 * between the number load and the svc.  Search a
+                 * window so such stubs are still hardened; a stray
+                 * "movz x8, #imm" that never feeds an svc is left
+                 * alone (windows without svc are not patch targets).
+                 * Another x8/w8 number load before the svc means the
+                 * first svc would execute THAT load's number, so the
+                 * pairing is ambiguous -- stop there rather than
+                 * patch the wrong svc (the scanner picks the pair up
+                 * from that load instead). */
+                for (w = 1; w <= 8; w++) {
                         unsigned int word;
 
                         if (off + 4 + 4 * w > len)
@@ -1158,6 +1186,9 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                                 svc_w = w;
                                 break;  /* "svc #0" found */
                         }
+                        if ((word & 0xFFE0001Fu) == 0xD2800008u ||
+                            (word & 0xFFE0001Fu) == 0x52800008u)
+                                break;
                 }
                 if (svc_w == 0)
                         continue;       /* no svc consuming this movz */
@@ -1610,6 +1641,42 @@ static void nproot_preload_init(void)
         g_loader = getenv("NPROOT_LOADER");
         g_debug = getenv("NPROOT_DEBUG") != NULL;
 
+        /* Same-zip assertion: the launcher exports the version string
+         * its own build embedded.  A preload left over from an older
+         * install silently misses every fix the installed launcher's
+         * release advertises (observed in the field as "still dying
+         * after the upgrade" when only the nproot binary had been
+         * replaced).  Not debug-gated: this is exactly the silent
+         * misconfiguration class worth shouting about. */
+        if (NPROOT_BUILD_ID[0] != '\0') {
+                const char *bid = getenv("NPROOT_BUILD_ID");
+
+                if (bid != NULL && strcmp(bid, NPROOT_BUILD_ID) != 0) {
+                        static const char m1[] =
+                                "[nproot] \u8b66\u544a: preload/libnproot.so \u4e0e nproot \u4e3b\u7a0b\u5e8f\u7248\u672c\u4e0d\u4e00\u81f4\uff08shim="
+                                NPROOT_BUILD_ID "\uff0c\u4e3b\u7a0b\u5e8f=";
+                        static const char m2[] =
+                                "\uff09\u2014\u2014\u8bf7\u6574\u5957\u91cd\u65b0\u5b89\u88c5\uff1anproot \u4e0e preload/ \u5fc5\u987b\u6765\u81ea\u540c\u4e00\u4e2a zip \u5305\n";
+                        size_t __attribute__((unused)) l1 = sizeof(m1) - 1;
+                        ssize_t ig;
+
+                        ig = write(2, m1, l1);
+                        ig = write(2, bid, strlen(bid));
+                        ig = write(2, m2, sizeof(m2) - 1);
+                        (void)ig;
+                }
+        }
+
+        /* A posix_spawn()/vfork child inherits the parent's
+         * mid-window all-signals-blocked mask THROUGH execve (the
+         * kernel keeps t->blocked), and glibc's internal exec paths
+         * never cross a hook we could unblock from.  Clear SIGSYS
+         * before anything else runs; the self-healing unblock also
+         * re-arms the guard if a previous force_sig() reset it, which
+         * turns a pending SIG_DFL kill into a harmless emulated
+         * return. */
+        nproot_unblock_sigsys();
+
         /* The SIGSYS guard, the libc patches and the census do not
          * depend on any nproot environment, so they run BEFORE the
          * NPROOT_ROOT gate below.  That makes the shim usable as a
@@ -1624,7 +1691,8 @@ static void nproot_preload_init(void)
          * KILLs -- exactly what a silent death needs to be explained.
          * Guest launches take the same path as before; only the order
          * within this constructor changed. */
-        if (ksigaction(SIGSYS, seccomp_sigsys_emulate, KSA_SIGINFO) == 0)
+        if (ksigaction(SIGSYS, seccomp_sigsys_emulate,
+                       KSA_SIGINFO | KSA_NODEFER) == 0)
                 dbg("seccomp SIGSYS guard installed");
         else
                 dbg("rt_sigaction(SIGSYS) failed: %d", errno);
@@ -2276,9 +2344,19 @@ int scandir64(const char *dir, struct dirent64 ***namelist,
 void *dlopen(const char *filename, int flags)
 {
         char buf[PATH_MAX];
+        void *h;
 
         init_real_all_once();
-        return real_dlopen(xlate(buf, sizeof(buf), filename), flags);
+        h = real_dlopen(xlate(buf, sizeof(buf), filename), flags);
+        /* NSS modules, locale plugins, language runtimes: anything
+         * mapped AFTER the constructor carries unhardened stubs of
+         * blocked numbers.  The walk is idempotent -- patched stubs no
+         * longer match the movz patterns -- so a plain re-run is both
+         * correct and cheap. */
+        if (h != NULL && __atomic_load_n(&g_shield_armed,
+                                         __ATOMIC_ACQUIRE))
+                shield_harden_maps();
+        return h;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2776,9 +2854,29 @@ int posix_spawnp(pid_t *pid, const char *file,
 static void nproot_unblock_sigsys(void)
 {
         unsigned long mask = 1UL << (SIGSYS - 1);
+        struct {
+                void *handler;
+                unsigned long flags;
+                void (*restorer)(void);
+                unsigned long mask;
+        } old;
+        long r;
 
         syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &mask, NULL,
                 sizeof(mask));
+        /* Self-heal: force_sig() may already have reset the guard to
+         * SIG_DFL during an all-blocked window -- invisible, since the
+         * handler never ran.  A reset also leaves any queued SIGSYS
+         * pending as a SIG_DFL kill that fires the moment the mask
+         * clears.  Re-arming here makes that pending signal deliver
+         * to the handler instead: the disposition is read at delivery
+         * time, not at queue time. */
+        memset(&old, 0, sizeof(old));
+        r = syscall(SYS_rt_sigaction, SIGSYS, 0UL, &old,
+                    sizeof(unsigned long));
+        if (r == 0 && old.handler != (void *)seccomp_sigsys_emulate)
+                ksigaction(SIGSYS, seccomp_sigsys_emulate,
+                           KSA_SIGINFO | KSA_NODEFER);
 }
 
 /* Programs block signals for good reasons (bash around command
@@ -2835,4 +2933,51 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
                 return -1;
         }
         return real_pthread_sigmask(how, set, oldset);
+}
+
+/* ------------------------------------------------------------------ */
+/* The generic syscall() door: here x8/w8 comes from a register, so no */
+/* static matcher can harden the site -- interpose the symbol instead. */
+/* ------------------------------------------------------------------ */
+
+/* The guard's own raw calls (rt_sigaction / rt_sigprocmask / the
+ * sigreturn stub) must never route back into this door: always let
+ * the signal-management numbers through, armed or not. */
+static int syscall_always_raw(long nr)
+{
+#if defined(__x86_64__)
+        return nr == 13 || nr == 14 || nr == 15;
+#elif defined(__aarch64__)
+        return nr == 134 || nr == 135 || nr == 139;
+#else
+        return 0;
+#endif
+}
+
+long syscall(long number, ...)
+{
+        va_list ap;
+        long a[6], i;
+
+        init_real_all_once();
+        if (real_syscall == NULL) {
+                errno = ENOSYS;
+                return -1;
+        }
+        /* Census probes run through this very symbol BEFORE the shield
+         * arms (shield_mark sets the flag only after a verified list
+         * exists), so arming the door cannot starve the census. */
+        if (__atomic_load_n(&g_shield_armed, __ATOMIC_ACQUIRE) &&
+            !syscall_always_raw(number) &&
+            shield_is_blocked((unsigned)number)) {
+                dbg("syscall(%ld) denied at the generic door "
+                    "(blocked nr)", number);
+                errno = ENOSYS;
+                return -1;
+        }
+        va_start(ap, number);
+        for (i = 0; i < 6; i++)
+                a[i] = va_arg(ap, long);
+        va_end(ap);
+        return real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
 }

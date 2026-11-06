@@ -91,11 +91,18 @@ jobs:
           pip install ziglang
           Z="python3 -m ziglang cc"
           ZFLAGS="-O2 -Wall -Wextra -Wl,-z,max-page-size=16384 -Wl,-z,noexecstack"
+          # Same command as src/GNUmakefile's build.h, same checkout:
+          # the shim's NPROOT_BUILD_ID matches the launcher's VERSION
+          # byte-for-byte, which powers the constructor's same-zip
+          # assertion (a stale preload/ beside an updated nproot
+          # binary is the "still dying after the upgrade" classic).
+          NPROOT_ID="$(git describe --tags --dirty --abbrev=8 --always 2>/dev/null || echo unknown)"
           mkdir -p shim-out/preload
           $Z -target aarch64-linux-gnu $ZFLAGS -fPIC -shared \
-            -DNPROOT_PATCH_SYSCALLS=1 \
+            -DNPROOT_PATCH_SYSCALLS=1 -DNPROOT_BUILD_ID="\"$NPROOT_ID\"" \
             -o shim-out/preload/libnproot.so proto/preload/nproot_preload.c -ldl
           $Z -target aarch64-linux-musl -dynamic $ZFLAGS -fPIC -shared \
+            -DNPROOT_BUILD_ID="\"$NPROOT_ID\"" \
             -o shim-out/preload/libnproot-musl.so proto/preload/nproot_preload.c -ldl
           # Standalone seccomp census: a static binary any Android
           # linker namespace accepts; run it in a plain Termux shell to
@@ -110,6 +117,9 @@ jobs:
           # of -- never ship one again.
           strings shim-out/preload/libnproot.so | grep -q 'seccomp trap'
           strings shim-out/preload/libnproot-musl.so | grep -q 'seccomp trap'
+          # same-zip assertion wired on both sides
+          strings shim-out/preload/libnproot.so | grep -q 'NPROOT_BUILD_ID'
+          strings shim-out/nproot | grep -q 'NPROOT_BUILD_ID'
           strings shim-out/nproot | grep -q 'Android seccomp'
 
       - uses: actions/upload-artifact@v7

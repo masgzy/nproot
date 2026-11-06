@@ -280,8 +280,8 @@ bionic 的 fork 同理）。另据实测，内核对多过滤器取**动作值�
 `TRAP(0x0003)` 永远压过自装过滤器的 `ERRNO(0x0005)`，所以
 「自装 ERRNO 过滤器抢先返回 ENOSYS」这条路在内核层面就走不通。
 
-上述语义已在设备内核源码里逐行验证（某 GKI 6.1 arm64 设备，
-`6.1.145-android14-11`，Android 16 用户态）：TRAP 路径为
+上述语义已在验证用的设备内核源码里逐行验证
+（`6.1.145-android14-11`，Android 16 用户态）：TRAP 路径为
 `force_sig_seccomp(this_syscall, data, false)` →
 `force_sig_info_to_task(..., HANDLER_CURRENT)`，其中
 `blocked = sigismember(&t->blocked, sig)`，一旦
@@ -330,7 +330,7 @@ CI 的 tests 工作流含此步骤）：TRAP(110)+KILL(105)+全信号阻塞窗�
 
 ## 11. 盾牌补丁（2026-11-06）
 
-真机（某 GKI 6.1 arm64 设备）日志复盘发现的三处问题，同日修复：
+真机日志复盘发现的三处问题，同日修复：
 
 * **汇总计数错误**：`shield_harden_maps()` 按"有命中的映射数"而非
   存根数累计——54 个存根被打进日志，汇总行却只显示
@@ -386,3 +386,39 @@ fork 均有 enter+exit），盾牌硬化 58 桩，但 bash 仍在 `.bashrc` 末�
 一行 shield 汇总）。本地功能测试（host x86_64，LD_PRELOAD）：
 sigprocmask/pthread_sigmask 剥离、fork 子进程掩码、posix_spawn、
 execvp 全部通过，剥离日志按预期出现。
+
+## 12. 盾牌第二轮：封闭通用门与自愈（2026-11-07）
+
+真机日志显示 fork/spawn 括号完整工作、58 个 X8 桩全部加固后，容器
+主进程仍然无日志死于信号 31（退出码 159），死亡点在 command 查找
+之后、任何进程创建括号之外。无日志死亡只有两种可能：致命 TRAP 时
+SIGSYS 已被屏蔽，或处置已被此前的 force_sig() 重置且挂起的
+SIG_DFL 信号在掩码清除时送达。本轮把这两条路径的剩余入口全部封死：
+
+* **通用 `syscall()` 门**：libc 的 `syscall(nr, ...)` 从寄存器装
+  x8，任何静态匹配器都无法覆盖这个桩——现在 shim 交接 `syscall`
+  符号本身：盾牌装填后，被禁编号直接返回 -ENOSYS，永不到内核。
+  census 探测恰好也走这个符号，但装填发生在 census 之后（按构造
+  顺序天然成立），探测不受影响；`rt_sigaction`/`rt_sigprocmask`/
+  `rt_sigreturn` 永远直通，防止 shim 自递归。
+* **dlopen 重扫**：构造器之后才映射进来的对象（NSS 模块、语言
+  运行时插件）现在会被立即重扫加固。扫描天然幂等——已补丁的桩
+  不再匹配 movz 模式。
+* **SA_NODEFER**：guard 处理器执行期间内核不再自动屏蔽 SIGSYS，
+  处理器内的嵌套 TRAP 重新进入处理器，而不是触发 force_sig() 把
+  处置重置为 SIG_DFL。处理器只改 ucontext 加一次 raw write，可
+  安全重入。
+* **自愈式解屏蔽**：`nproot_unblock_sigsys()` 在解阻塞之外，每次
+  都用内核 ABI 查询 SIGSYS 处置，发现被重置就立即重装 guard——
+  已挂起的 SIG_DFL 死亡信号会改投递到处理器（内核在**投递时**才
+  读处置，不是入队时），死亡变成一次普通的 ENOSYS 模拟。构造器
+  第一动作就是解屏蔽：posix_spawn/vfork 子进程继承全阻塞掩码穿
+  过 execve 的入场路径从此无感。
+* **同包断言**：launcher 导出 `NPROOT_BUILD_ID`（与 `-V` 同源的
+  git 描述串），shim 构造器发现不一致时未经 debug 门控直接向
+  stderr 大声警告——"只更新了 nproot 主程序、preload/ 还是旧
+  版"这一静默错配从此可见。死亡报告文案也加了对应提示。
+* **窗口 3→8 + 歧义保护**：movz 与 svc 之间被调度插入更多指令的
+  桩也能配对；窗口内出现第二个 x8/w8 装载则停手不补——第一个
+  svc 此时执行的是另一个装载的编号，宁缺毋滥（该对会从下一个
+  装载处被正确拾取）。
