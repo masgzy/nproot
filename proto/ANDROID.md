@@ -347,3 +347,42 @@ CI 的 tests 工作流含此步骤）：TRAP(110)+KILL(105)+全信号阻塞窗�
   PLT 入口，`NPROOT_DEBUG=1` 下用 `process window enter/exit`
   标记窗口边界——死亡日志停在哪个窗口、凶手范围立刻收窄到对应
   的 glibc 内部路径。
+
+## 12. 二轮修复：W8 存根、缓存投毒、SIGSYS 永不阻塞（2026-11-06）
+
+ca0631c 上真机复测：fork/posix_spawn 窗口全部完整（`id`/`grep` 两次
+fork 均有 enter+exit），盾牌硬化 58 桩，但 bash 仍在 `.bashrc` 末端
+（`/etc/debian_chroot`、`command-not-found` 访问检查之后）静默死于
+信号 31，死亡前无任何 trap 日志。同日三处修复：
+
+* **glibc C 包装型存根（W8 形式）漏检**：glibc 经
+  `INTERNAL_SYSCALL` 实现的 C 包装（`faccessat2`、`openat2`、
+  `statx`、`close_range` 等）发的是 32 位 `movz w8, #nr`
+  （0x52800008），此前匹配器只认 64 位 `movz x8`（0xD2800008）。
+  真机日志中 `faccessat2`（nr 439）正因如此"被禁却未补"——58 个
+  补丁桩里没有它。现在两种形式都收。
+* **census 缓存投毒**：`shield_from_cache()` 把缓存里的 0 当作
+  "已验证无过滤"，一次被投毒/写坏的缓存或一次子进程连环死亡的
+  静默 sweep（重启日志被 debug 门控）会让盾牌永久解除武装——
+  真机上表现为启动即死 + `census found nothing blocked`。现在
+  Android 内核上缓存为 0 一律重新静默 sweep，空结果只有本次进程
+  亲自验证才被采信；sweep 部分失败时明确报
+  `census FAILED (partial sweep) -- shield NOT armed`。
+* **SIGSYS 永不阻塞（防御闭环）**：新增 PLT 拦截
+  `sigprocmask`/`pthread_sigmask`，对 SIG_BLOCK/SIG_SETMASK 一律
+  剥离 SIGSYS——每一次实际剥离都以 debug 日志记录
+  （`sigprocmask: stripped SIGSYS (how=N)`），下一次静默死亡的
+  日志会直接点名试图阻塞者。`fork`/`posix_spawn`/`posix_spawnp`
+  包装器在 real 调用返回后、`do_execve` 在入口处，都以 raw
+  rt_sigprocmask（内核 ABI 8 字节掩码）把 SIGSYS 解阻塞——
+  exec 链上的新镜像因此永远以 SIGSYS 可投递状态启动。
+  glibc 内部（不经 PLT）的阻塞窗口由 census 验证过的存根硬化
+  兜底；两层合拢后"被禁 syscall 在阻塞窗口内触发"这一死亡路径
+  在机制上无入口。
+
+配套：pdi18n 侧把 `NPROOT_*`（DEBUG/CENSUS/SHIELD/BACKEND 等）
+透传进启动器环境——此前 `NPROOT_DEBUG=1 pd sh debian` 里的变量
+被 pd 的从零构建 child_env 丢弃，shim 无从开启 debug（日志只出
+一行 shield 汇总）。本地功能测试（host x86_64，LD_PRELOAD）：
+sigprocmask/pthread_sigmask 剥离、fork 子进程掩码、posix_spawn、
+execvp 全部通过，剥离日志按预期出现。

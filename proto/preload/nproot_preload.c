@@ -366,6 +366,9 @@ static int      (*real_posix_spawnp)(pid_t *, const char *,
                                 const posix_spawn_file_actions_t *,
                                 const posix_spawnattr_t *,
                                 char *const [], char *const []);
+static int      (*real_sigprocmask)(int, const sigset_t *, sigset_t *);
+static int      (*real_pthread_sigmask)(int, const sigset_t *,
+                                        sigset_t *);
 
 static void init_real_all(void)
 {
@@ -438,6 +441,8 @@ static void init_real_all(void)
         real_fork = dlsym(RTLD_NEXT, "fork");
         real_posix_spawn = dlsym(RTLD_NEXT, "posix_spawn");
         real_posix_spawnp = dlsym(RTLD_NEXT, "posix_spawnp");
+        real_sigprocmask = dlsym(RTLD_NEXT, "sigprocmask");
+        real_pthread_sigmask = dlsym(RTLD_NEXT, "pthread_sigmask");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1119,9 +1124,19 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                  * the compare -- a mask that drops Rd would also need
                  * to compare against 0xD2800000 AND read Rd, which is
                  * exactly how a "hardened 0" regression looked on a
-                 * real device (every x8 stub was silently rejected). */
-                if ((ins & 0xFFE0001Fu) != 0xD2800008u)
-                        continue;       /* not "movz x8, #imm16" */
+                 * real device (every x8 stub was silently rejected).
+                 *
+                 * glibc's C-wrapper syscalls -- faccessat2, openat2,
+                 * statx, close_range, anything implemented in C via
+                 * INTERNAL_SYSCALL -- emit the 32-bit form "movz w8,
+                 * #nr" (0x52800008) instead; W8 zero-extends into X8
+                 * before the svc, so the kernel sees the same number.
+                 * On the device log faccessat2 (nr 439) sat
+                 * blocked-but-unpatched for exactly this reason while
+                 * 58 X8-form stubs were hardened.  Accept both. */
+                if ((ins & 0xFFE0001Fu) != 0xD2800008u &&
+                    (ins & 0xFFE0001Fu) != 0x52800008u)
+                        continue;       /* not "movz x8/w8, #imm16" */
                 nr = (ins >> 5) & 0xFFFFu;
                 if (!shield_is_blocked(nr))
                         continue;
@@ -1486,13 +1501,22 @@ static void shield_from_cache(void)
 {
         static const int nr_max = 463;
         int blocked[512], deadly[512];
-        int nb = 0, nd = 0, n, partial, patched;
+        int nb = 0, nd = 0, n, partial = 0, patched;
 
         if (getenv("NPROOT_SHIELD") != NULL &&
             strcmp(getenv("NPROOT_SHIELD"), "0") == 0)
                 return;
         n = shield_cache_load(blocked, 512);
-        if (n < 0) {
+        if (n < 0 || (n == 0 && android_host())) {
+                /* An empty census on a filtered kernel is not
+                 * trustworthy: a poisoned or half-written cache, or a
+                 * quiet sweep whose children kept dying (the restart
+                 * chatter is debug-gated, so the failure was silent),
+                 * would otherwise keep the shield disarmed forever
+                 * after -- observed on the device as an early death
+                 * with "census found nothing blocked".  Re-sweep; an
+                 * empty result is only believed when this process
+                 * proved it itself. */
                 g_census_quiet = 1;
                 partial = census_sweep(blocked, 512, &nb,
                                        deadly, 512, &nd, nr_max);
@@ -1506,8 +1530,12 @@ static void shield_from_cache(void)
                 shield_log("seccomp shield: hardened %d blocked-syscall "
                            "stubs (census: %d blocked, scanned %d exec "
                            "mappings)", patched, n, g_shield_scan_ranges);
-        } else if (n == 0) {
+        } else if (n == 0 && partial == 0) {
                 shield_log("seccomp shield: census found nothing blocked");
+        } else if (n == 0) {
+                shield_log("seccomp shield: census FAILED (partial "
+                           "sweep) -- shield NOT armed; re-run with "
+                           "NPROOT_DEBUG=1");
         }
 }
 
@@ -2530,6 +2558,8 @@ static int exec_native_route(const char *prog, char *const argv[],
         return i;
 }
 
+static void nproot_unblock_sigsys(void);
+
 static int do_execve(const char *path, char *const argv[], char *const envp[])
 {
         static __thread char *nargv[4096];
@@ -2539,6 +2569,11 @@ static int do_execve(const char *path, char *const argv[], char *const envp[])
         char *const *rest = (char *const *)argv;
         int is_elf, dyn;
         int depth;
+
+        /* The new image inherits this mask through execve: leave SIGSYS
+         * blocked here and the guest starts one blocked-window trap
+         * away from a silent death, with its guard still unarmed. */
+        nproot_unblock_sigsys();
 
         if (g_loader == NULL) {
                 char buf[PATH_MAX];
@@ -2678,6 +2713,9 @@ pid_t fork(void)
                 return -1;
         }
         rc = real_fork();
+        /* both sides: the child may have inherited a mid-window mask,
+         * and the parent's own restore must never leave SIGSYS set */
+        nproot_unblock_sigsys();
         if (g_debug)
                 dbg("process window exit: fork rc=%d", (int)rc);
         return rc;
@@ -2694,6 +2732,7 @@ int posix_spawn(pid_t *pid, const char *path,
         if (g_debug)
                 dbg("process window enter: posix_spawn %s", path);
         rc = real_posix_spawn(pid, path, acts, attr, argv, envp);
+        nproot_unblock_sigsys();
         if (g_debug)
                 dbg("process window exit: posix_spawn rc=%d", rc);
         return rc;
@@ -2710,7 +2749,90 @@ int posix_spawnp(pid_t *pid, const char *file,
         if (g_debug)
                 dbg("process window enter: posix_spawnp %s", file);
         rc = real_posix_spawnp(pid, file, acts, attr, argv, envp);
+        nproot_unblock_sigsys();
         if (g_debug)
                 dbg("process window exit: posix_spawnp rc=%d", rc);
         return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* SIGSYS must never sit blocked: force_sig() then resets the          */
+/* disposition to SIG_DFL and the next trap kills silently             */
+/* ------------------------------------------------------------------ */
+
+#ifndef SYS_rt_sigprocmask
+#if defined(__x86_64__)
+#define SYS_rt_sigprocmask 14
+#elif defined(__aarch64__)
+#define SYS_rt_sigprocmask 135
+#endif
+#endif
+
+/* Raw kernel ABI: a libc sigset_t is misread across libc families,
+ * and the guard's own rt_sigaction already goes through the same
+ * 8-byte-mask convention.  Silent by design -- it runs on every
+ * fork/spawn/exec and merely re-asserts the only invariant the
+ * seccomp guard needs: SIGSYS deliverable. */
+static void nproot_unblock_sigsys(void)
+{
+        unsigned long mask = 1UL << (SIGSYS - 1);
+
+        syscall(SYS_rt_sigprocmask, SIG_UNBLOCK, &mask, NULL,
+                sizeof(mask));
+}
+
+/* Programs block signals for good reasons (bash around command
+ * substitution, runtimes around thread creation); glibc does the same
+ * inside its own fork/spawn windows.  A seccomp trap delivered in any
+ * such window is force_sig()ed to SIG_DFL first -- silent death, no
+ * handler, no log.  Interpose the public mask entry points and strip
+ * SIGSYS from every block request.  glibc-internal callers bypass the
+ * PLT, which is fine: the census-verified stub hardening covers their
+ * syscall sites, and the fork/spawn wrappers above unblock after
+ * every window.  Each actual strip is logged at debug level, so the
+ * next silent-death log names the would-be blocker for free.
+ * sigdelset/memcmp are pure memory arithmetic: async-signal-safe. */
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+        sigset_t stripped;
+
+        init_real_all_once();
+        if (set != NULL && real_sigprocmask != NULL &&
+            (how == SIG_BLOCK || how == SIG_SETMASK)) {
+                memcpy(&stripped, set, sizeof(stripped));
+                sigdelset(&stripped, SIGSYS);
+                if (memcmp(&stripped, set, sizeof(stripped)) != 0) {
+                        dbg("sigprocmask: stripped SIGSYS (how=%d)",
+                            how);
+                        set = &stripped;
+                }
+        }
+        if (real_sigprocmask == NULL) {
+                errno = ENOSYS;
+                return -1;
+        }
+        return real_sigprocmask(how, set, oldset);
+}
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+        sigset_t stripped;
+
+        init_real_all_once();
+        if (set != NULL && real_pthread_sigmask != NULL &&
+            (how == SIG_BLOCK || how == SIG_SETMASK)) {
+                memcpy(&stripped, set, sizeof(stripped));
+                sigdelset(&stripped, SIGSYS);
+                if (memcmp(&stripped, set, sizeof(stripped)) != 0) {
+                        dbg("pthread_sigmask: stripped SIGSYS "
+                            "(how=%d)", how);
+                        set = &stripped;
+                }
+        }
+        if (real_pthread_sigmask == NULL) {
+                errno = ENOSYS;
+                return -1;
+        }
+        return real_pthread_sigmask(how, set, oldset);
 }
