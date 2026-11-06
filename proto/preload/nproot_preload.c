@@ -1051,9 +1051,12 @@ static int shield_is_blocked(unsigned nr)
         return (g_shield_blocked[nr >> 3] >> (nr & 7)) & 1;
 }
 
-/* mprotect the covering pages RWX, memcpy the replacement, restore */
-static void shield_patch_at(void *addr, size_t len,
-                            const void *rep, size_t rep_len)
+/* mprotect the covering pages RWX, memcpy the replacement, restore.
+ * Returns 1 on success, 0 if the pages could not be made writable --
+ * callers must count only real patches, a silently skipped one would
+ * fake the whole shield as working (hardened>0 means patched). */
+static int shield_patch_at(void *addr, size_t len,
+                           const void *rep, size_t rep_len)
 {
         size_t pg = (size_t)sysconf(_SC_PAGESIZE);
         uintptr_t page = (uintptr_t)addr & ~((uintptr_t)pg - 1);
@@ -1062,9 +1065,10 @@ static void shield_patch_at(void *addr, size_t len,
 
         if (mprotect((void *)page, endp - page,
                      PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
-                return;
+                return 0;
         memcpy(addr, rep, rep_len);
         mprotect((void *)page, endp - page, PROT_READ | PROT_EXEC);
+        return 1;
 }
 
 /* Scan [start, end) for stubs of blocked numbers; returns patches made */
@@ -1084,10 +1088,17 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
         static const unsigned int rep[2] = { 0x928004A0u, 0xD503201Fu };
 
         for (off = 0; off + 8 <= len; off += 4) {
-                unsigned int ins;
+                unsigned int ins, nr;
 
                 memcpy(&ins, (const void *)(start + off), 4);
-                if ((ins & 0xFFE0001Fu) != 0xD2800000u)
+                /* The fixed pattern INCLUDING Rd: syscall numbers go in
+                 * x8 by ABI, and glibc/bionic stubs are always "movz
+                 * x8, #nr".  0xD2800008 keeps the x8 register field in
+                 * the compare -- a mask that drops Rd would also need
+                 * to compare against 0xD2800000 AND read Rd, which is
+                 * exactly how a "hardened 0" regression looked on a
+                 * real device (every x8 stub was silently rejected). */
+                if ((ins & 0xFFE0001Fu) != 0xD2800008u)
                         continue;       /* not "movz x8, #imm16" */
                 {
                         unsigned int nxt;
@@ -1096,10 +1107,18 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                         if (nxt != 0xD4000001u)
                                 continue;   /* not "svc #0" */
                 }
-                if (!shield_is_blocked((ins >> 5) & 0xFFFFu))
+                nr = (ins >> 5) & 0xFFFFu;
+                if (!shield_is_blocked(nr))
                         continue;
-                shield_patch_at((void *)(start + off), 8, rep, sizeof(rep));
-                patched++;
+                if (shield_patch_at((void *)(start + off), 8,
+                                    rep, sizeof(rep))) {
+                        patched++;
+                        dbg("shield: patched nr=%u stub at %p", nr,
+                            (void *)(start + off));
+                } else {
+                        dbg("shield: mprotect RWX failed at %p",
+                            (void *)(start + off));
+                }
                 off += 4;               /* the svc was consumed */
         }
 #elif defined(__x86_64__)
@@ -1117,8 +1136,14 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 memcpy(&nr, p + 1, 4);
                 if (!shield_is_blocked(nr))
                         continue;
-                shield_patch_at((void *)p, 7, rep, sizeof(rep));
-                patched++;
+                if (shield_patch_at((void *)p, 7, rep, sizeof(rep))) {
+                        patched++;
+                        dbg("shield: patched nr=%u stub at %p", nr,
+                            (void *)p);
+                } else {
+                        dbg("shield: mprotect RWX failed at %p",
+                            (void *)p);
+                }
                 off += 6;
         }
 #endif
@@ -1131,6 +1156,12 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
  * skipped: its sigreturn stub (mov eax,15; syscall) must never be
  * hardened even if the filter ever traps rt_sigreturn. */
 #define NPROOT_SHIELD_MAPS_BUF 16384
+
+/* self-description for the summary line: how many executable mappings
+ * the walk actually scanned -- a real-device log with "hardened 0"
+ * and a healthy scanned count points at the matcher, a scanned count
+ * of 0 points at the maps parser */
+static int g_shield_scan_ranges;
 
 /* Hand-rolled parsers: glibc 2.38+ redirects strtol/strtoul to
  * __isoc23_* symbols (versioned GLIBC_2.38), which would make the
@@ -1244,9 +1275,15 @@ static int shield_harden_maps(void)
                                         }
                                         if (path != NULL && perms_x &&
                                             strncmp(path, "/system/lib", 11) != 0 &&
-                                            strstr(path, "libnproot") == NULL &&
-                                            shield_scan_range(start, end) > 0)
-                                                patched++;
+                                            strstr(path, "libnproot") == NULL) {
+                                                int hits;
+
+                                                g_shield_scan_ranges++;
+                                                hits = shield_scan_range(start,
+                                                                         end);
+                                                if (hits > 0)
+                                                        patched++;
+                                        }
                                 }
                         }
                         p = nl + 1;
@@ -1423,7 +1460,8 @@ static void shield_from_cache(void)
         if (n > 0) {
                 patched = shield_arm(blocked, n);
                 shield_log("seccomp shield: hardened %d blocked-syscall "
-                           "stubs (census: %d blocked)", patched, n);
+                           "stubs (census: %d blocked, scanned %d exec "
+                           "mappings)", patched, n, g_shield_scan_ranges);
         } else if (n == 0) {
                 shield_log("seccomp shield: census found nothing blocked");
         }
@@ -1467,8 +1505,9 @@ static void seccomp_census(void)
 
                 snprintf(line, sizeof(line),
                          "[nproot] shield: hardened %d blocked-syscall "
-                         "stubs (census: %d blocked, %d unsaveable)\n",
-                         patched, nb, nd);
+                         "stubs (census: %d blocked, %d unsaveable, "
+                         "scanned %d exec mappings)\n",
+                         patched, nb, nd, g_shield_scan_ranges);
                 ignored = write(2, line, strlen(line));
         }
         if (partial == 0)

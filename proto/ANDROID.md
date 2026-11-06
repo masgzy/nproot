@@ -283,6 +283,15 @@ syscall，不存在误匹配。
 
 * 普查结果按内核版本缓存在 `PROOT_TMP_DIR/nproot-seccomp-v1-<release>`，
   只有首次启动付约几秒的 sweep 成本，之后每次启动只做一次毫秒级扫描；
+* aarch64 匹配掩码必须**带上 Rd 位**：完整模式是 `0xD2800008`（movz
+  **x8**），首版把 Rd 写进掩码、常数却按 `0xD2800000`（x0）比较——所有
+  x8 存根被静默拒绝，真机一度「hardened 0」照旧死于信号 31，而
+  x86_64/CI 全绿（B8 操作码无寄存器位，掩盖了回归）。教训：预处理门控
+  的单架构分支不被对方架构的 CI 编译，汇总行必须能自证；
+* 汇总行因此带 `scanned N exec mappings`（实际扫描过的可执行映射数，
+  census 模式与缓存路径都有）：`hardened 0` 但 scanned 正常 → 匹配器
+  出了问题；`scanned 0` → maps 解析出了问题。debug 级别下逐存根打
+  `patched nr=…`，mprotect 失败不计入硬化数也不再静默；
 * `NPROOT_SHIELD=0` 关闭；`NPROOT_SHIELD=1` 在非 Android 内核上强制
   开启（CI 自测用）；显式 `NPROOT_CENSUS=1` 时先 verbose 普查再硬化；
 * census 的 sweep 现跑在可重启的一次性 sweep 子进程里（raw
