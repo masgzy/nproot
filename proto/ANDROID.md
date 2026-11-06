@@ -272,6 +272,20 @@ bionic 的 fork 同理）。另据实测，内核对多过滤器取**动作值�
 `TRAP(0x0003)` 永远压过自装过滤器的 `ERRNO(0x0005)`，所以
 「自装 ERRNO 过滤器抢先返回 ENOSYS」这条路在内核层面就走不通。
 
+上述语义已在设备内核源码里逐行验证（某 GKI 6.1 arm64 设备，
+`6.1.145-android14-11`，Android 16 用户态）：TRAP 路径为
+`force_sig_seccomp(this_syscall, data, false)` →
+`force_sig_info_to_task(..., HANDLER_CURRENT)`，其中
+`blocked = sigismember(&t->blocked, sig)`，一旦
+`blocked || ignored` 就把 `sa_handler` 重置为 `SIG_DFL` 并解除屏蔽
+——重置发生在**投递之前**，handler 原理上永远看不到屏蔽窗口内的
+TRAP。该文件与 android14-6.1 分支头逐字节对比：seccomp.c 仅差
+notify 等待状态机（快照较旧），signal.c 路径上唯一厂商钩子
+`android_vh_signal_coredump_check` 只影响 coredump 决策；系统调用
+号表为原生 asm-generic（6.1 无 fchmodat2，452 号是保留洞、照样
+TRAP）。结论：无厂商魔改，盾牌（让 guest 发不出被禁号）是唯一
+完备修法。
+
 盾牌因此走指令补丁路线（与启动器 L0 同理，但 census 驱动、精确到
 被禁号）：shim 构造函数扫描**所有已加载对象的代码段**，把
 `movz x8, #NR; svc #0`（aarch64）/ `mov eax, NR; syscall`（x86_64）
