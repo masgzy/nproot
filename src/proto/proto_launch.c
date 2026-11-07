@@ -1152,6 +1152,18 @@ void proto_launch(Tracee *tracee, char *const argv[])
                             config->suid == 0 && config->rgid == 0 &&
                             config->egid == 0 && config->sgid == 0)
                                 fake_id0 = true;
+                } else if (ext == NULL && android_host()) {
+                        /* No -i/-0 on the command line, but on Android
+                         * the app uid would surface inside the guest as
+                         * "I have no name!" (getpwuid(app-uid) fails)
+                         * and apt/pip would refuse to work unrooted.
+                         * Default to proot's root-id semantics -- what
+                         * --change-id=0:0 picks anyway; NPROOT_FAKEID0=0
+                         * opts out. */
+                        const char *env = getenv("NPROOT_FAKEID0");
+
+                        if (env == NULL || strcmp(env, "0") != 0)
+                                fake_id0 = true;
                 }
         }
         if (fake_id0)

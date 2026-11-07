@@ -315,6 +315,11 @@ static int      (*real_scandir)(const char *, struct dirent ***,
                                         const struct dirent **));
 static void     *(*real_dlopen)(const char *, int);
 static char     *(*real_getcwd)(char *, size_t);
+static int      (*real_chdir)(const char *);
+#ifndef __GLIBC__
+static int      (*real_statx)(int, const char *, int, unsigned int,
+                              struct statx *);
+#endif
 static int      (*real_execve)(const char *, char *const [], char *const []);
 static int      (*real_execv)(const char *, char *const []);
 static int      (*real_execvp)(const char *, char *const []);
@@ -410,6 +415,10 @@ static void init_real_all(void)
         real_scandir = dlsym(RTLD_NEXT, "scandir");
         real_dlopen = dlsym(RTLD_NEXT, "dlopen");
         real_getcwd = dlsym(RTLD_NEXT, "getcwd");
+        real_chdir = dlsym(RTLD_NEXT, "chdir");
+#ifndef __GLIBC__
+        real_statx = dlsym(RTLD_NEXT, "statx");
+#endif
         real_execve = dlsym(RTLD_NEXT, "execve");
         real_execv = dlsym(RTLD_NEXT, "execv");
         real_execvp = dlsym(RTLD_NEXT, "execvp");
@@ -577,6 +586,41 @@ static int ksigaction(int nr, void *handler, unsigned long flags)
 }
 
 static void nproot_unblock_sigsys(void);
+
+/* Fatal-signal reporter: a death by SIGILL(4)/SIGFPE(8)/SIGBUS(7)/
+ * SIGSEGV(11) used to leave NOTHING on the terminal -- the launcher
+ * only saw "signal 7, exit 135" (the musl container crash on the
+ * device).  Print one line with the faulting ip + address, then
+ * restore the default disposition and re-raise so the exit status
+ * and core dump stay exactly what the kernel would have produced.
+ * A guest that installs its own handler later simply overwrites
+ * ours, and fork/exec children inherit it harmlessly. */
+static void fatal_sig_report(int sig, siginfo_t *si, void *uctx)
+{
+        char b[128];
+        uintptr_t pc = 0;
+        int n;
+        struct sigaction dfl;
+
+#if defined(__aarch64__)
+        pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.pc;
+#elif defined(__x86_64__)
+        pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+#endif
+        n = snprintf(b, sizeof(b),
+                     "[nproot] fatal signal %d at ip=%p addr=%p "
+                     "(si_code=%d) -- include this line in any report\n",
+                     sig, (void *)pc, si->si_addr, si->si_code);
+        if (n > 0) {
+                ssize_t ig = write(2, b, (size_t)n);
+
+                (void)ig;
+        }
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, NULL);
+        raise(sig);
+}
 
 static void seccomp_sigsys_emulate(int signum, siginfo_t *si, void *uctx)
 {
@@ -1104,6 +1148,41 @@ static int shield_is_blocked(unsigned nr)
  * Returns 1 on success, 0 if the pages could not be made writable --
  * callers must count only real patches, a silently skipped one would
  * fake the whole shield as working (hardened>0 means patched). */
+
+/* Deferred patching: scanning only COLLECTS sites; the pages are then
+ * made writable once per contiguous run.  The old per-stub flow issued
+ * four mprotect calls per stub (two sites x RW + restore), which on a
+ * 59-stub libc meant 236 mprotect syscalls per exec -- most of the
+ * visible per-command latency.  One bulk round costs a handful. */
+#define NPROOT_PATCH_MAX 1024
+
+struct shield_patch {
+        void *addr;
+        const void *rep;
+        size_t rep_len;
+};
+
+static struct shield_patch g_shield_patches[NPROOT_PATCH_MAX];
+static int g_shield_npatches;
+
+static void shield_collect(void *addr, const void *rep, size_t rep_len)
+{
+        if (g_shield_npatches < NPROOT_PATCH_MAX) {
+                g_shield_patches[g_shield_npatches].addr = addr;
+                g_shield_patches[g_shield_npatches].rep = rep;
+                g_shield_patches[g_shield_npatches].rep_len = rep_len;
+                g_shield_npatches++;
+        }
+}
+
+static int shield_patch_cmp(const void *a, const void *b)
+{
+        uintptr_t xa = (uintptr_t)((const struct shield_patch *)a)->addr;
+        uintptr_t xb = (uintptr_t)((const struct shield_patch *)b)->addr;
+
+        return xa < xb ? -1 : (xa > xb ? 1 : 0);
+}
+
 static int shield_patch_at(void *addr, size_t len,
                            const void *rep, size_t rep_len)
 {
@@ -1118,6 +1197,69 @@ static int shield_patch_at(void *addr, size_t len,
         memcpy(addr, rep, rep_len);
         mprotect((void *)page, endp - page, PROT_READ | PROT_EXEC);
         return 1;
+}
+
+/* Apply every collected site: sort by address, group the covering
+ * pages into runs, mprotect each run RWX once, write, restore once.
+ * A run whose mprotect fails falls back to the per-stub path so the
+ * count still only reflects sites actually patched. */
+static int shield_apply_patches(void)
+{
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+        int base, ok = 0;
+
+        if (g_shield_npatches == 0)
+                return 0;
+        qsort(g_shield_patches, (size_t)g_shield_npatches,
+              sizeof(g_shield_patches[0]), shield_patch_cmp);
+        base = 0;
+        while (base < g_shield_npatches) {
+                uintptr_t start = (uintptr_t)g_shield_patches[base].addr &
+                                  ~((uintptr_t)pg - 1);
+                uintptr_t end = start + pg;
+                int i2;
+
+                for (i2 = base + 1; i2 < g_shield_npatches; i2++) {
+                        uintptr_t page =
+                                (uintptr_t)g_shield_patches[i2].addr &
+                                ~((uintptr_t)pg - 1);
+
+                        if (page < end)
+                                continue;       /* inside the run */
+                        if (page == end) {
+                                end += pg;
+                                continue;
+                        }
+                        break;                  /* next run starts here */
+                }
+                if (mprotect((void *)start, end - start,
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        int j;
+
+                        for (j = base; j < i2; j++) {
+                                memcpy(g_shield_patches[j].addr,
+                                       g_shield_patches[j].rep,
+                                       g_shield_patches[j].rep_len);
+                                ok++;
+                        }
+                        mprotect((void *)start, end - start,
+                                 PROT_READ | PROT_EXEC);
+                } else {
+                        int j;
+
+                        for (j = base; j < i2; j++) {
+                                if (shield_patch_at(
+                                            g_shield_patches[j].addr,
+                                            g_shield_patches[j].rep_len,
+                                            g_shield_patches[j].rep,
+                                            g_shield_patches[j].rep_len))
+                                        ok++;
+                        }
+                }
+                base = i2;
+        }
+        g_shield_npatches = 0;
+        return ok;
 }
 
 /* Scan [start, end) for stubs of blocked numbers; returns patches made */
@@ -1192,18 +1334,12 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 }
                 if (svc_w == 0)
                         continue;       /* no svc consuming this movz */
-                if (shield_patch_at((void *)(start + off), 4,
-                                    &rep[0], 4) &&
-                    shield_patch_at((void *)(start + off + 4 * svc_w),
-                                    4, &rep[1], 4)) {
-                        patched++;
-                        dbg("shield: patched nr=%u stub at %p "
-                            "(svc +%d)", nr, (void *)(start + off),
-                            svc_w);
-                } else {
-                        dbg("shield: mprotect RWX failed at %p",
-                            (void *)(start + off));
-                }
+                shield_collect((void *)(start + off), &rep[0], 4);
+                shield_collect((void *)(start + off + 4 * svc_w),
+                               &rep[1], 4);
+                patched++;
+                dbg("shield: queued nr=%u stub at %p (svc +%d)",
+                    nr, (void *)(start + off), svc_w);
                 off += 4 * svc_w;       /* consumed through the svc */
         }
 #elif defined(__x86_64__)
@@ -1221,14 +1357,10 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 memcpy(&nr, p + 1, 4);
                 if (!shield_is_blocked(nr))
                         continue;
-                if (shield_patch_at((void *)p, 7, rep, sizeof(rep))) {
-                        patched++;
-                        dbg("shield: patched nr=%u stub at %p", nr,
-                            (void *)p);
-                } else {
-                        dbg("shield: mprotect RWX failed at %p",
-                            (void *)p);
-                }
+                shield_collect((void *)p, rep, sizeof(rep));
+                patched++;
+                dbg("shield: queued nr=%u stub at %p", nr,
+                    (const void *)p);
                 off += 6;
         }
 #endif
@@ -1382,6 +1514,10 @@ static int shield_harden_maps(void)
                 memmove(buf, p, have);
         }
         syscall(NPROOT_SYS_CLOSE, fd);
+        /* one bulk mprotect round covers everything collected above;
+         * the return value is the count of sites actually written */
+        if (g_shield_npatches > 0)
+                patched = shield_apply_patches();
         return patched;
 }
 
@@ -1445,7 +1581,17 @@ static int shield_cache_load(int *nrs, int max)
         p = nl + 1;
         while (*p != '\0' && n < max) {
                 long v;
-                const char *before = p;
+                const char *before;
+
+                /* the save format is " %d": the leading space before
+                 * every number used to stop this parser dead on the
+                 * first field, so the cache NEVER loaded and every
+                 * process re-ran the whole ~700-probe sweep (the
+                 * per-command latency on the device).  Skip separators
+                 * before each number. */
+                while (*p == ' ' || *p == '\n' || *p == '\t')
+                        p++;
+                before = p;
 
                 v = shield_parse_dec((const char **)&p);
                 if (p == before)
@@ -1558,11 +1704,16 @@ static void shield_from_cache(void)
         }
         if (n > 0) {
                 patched = shield_arm(blocked, n);
-                shield_log("seccomp shield: hardened %d blocked-syscall "
-                           "stubs (census: %d blocked, scanned %d exec "
-                           "mappings)", patched, n, g_shield_scan_ranges);
+                /* the per-process summary used to be unconditional:
+                 * every exec of every command printed one line to the
+                 * terminal.  Quiet unless debugging now. */
+                if (g_debug)
+                        shield_log("seccomp shield: hardened %d blocked-syscall "
+                                   "stubs (census: %d blocked, scanned %d exec "
+                                   "mappings)", patched, n, g_shield_scan_ranges);
         } else if (n == 0 && partial == 0) {
-                shield_log("seccomp shield: census found nothing blocked");
+                if (g_debug)
+                        shield_log("seccomp shield: census found nothing blocked");
         } else if (n == 0) {
                 shield_log("seccomp shield: census FAILED (partial "
                            "sweep) -- shield NOT armed; re-run with "
@@ -1696,6 +1847,22 @@ static void nproot_preload_init(void)
                 dbg("seccomp SIGSYS guard installed");
         else
                 dbg("rt_sigaction(SIGSYS) failed: %d", errno);
+
+        /* Fatal-signal reporter (see fatal_sig_report above): the
+         * device musl crash surfaced only as "signal 7, exit 135"
+         * with zero evidence to work from. */
+        {
+                struct sigaction fsa;
+
+                memset(&fsa, 0, sizeof(fsa));
+                fsa.sa_sigaction = fatal_sig_report;
+                fsa.sa_flags = SA_SIGINFO;
+                sigemptyset(&fsa.sa_mask);
+                sigaction(SIGILL, &fsa, NULL);
+                sigaction(SIGFPE, &fsa, NULL);
+                sigaction(SIGBUS, &fsa, NULL);
+                sigaction(SIGSEGV, &fsa, NULL);
+        }
 
 #ifdef NPROOT_PATCH_SYSCALLS
         patch_dangerous_syscalls();
@@ -1854,7 +2021,7 @@ int creat64(const char *path, mode_t mode)
 #endif /* __GLIBC__ */
 
 /* ------------------------------------------------------------------ */
-/* stat family (statx deliberately NOT interposed -- see file header)  */
+/* stat family (statx is interposed on musl only -- see below)         */
 /* ------------------------------------------------------------------ */
 
 /* Rewrite ownership to root:0:0 when -0 emulation is on, so guest
@@ -1951,6 +2118,29 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags)
         return rc;
 }
 #endif /* __GLIBC__ */
+
+#ifndef __GLIBC__
+/* statx: musl guests expose ONE unversioned symbol and busybox plus
+ * newer coreutils call it directly, so with no hook their absolute
+ * paths hit the HOST filesystem while the very same file exec'ed
+ * fine from PATH lookup (device log: "ls /usr/bin/apt-cdrom" ENOENT
+ * next to a working apt-cdrom).  musl has no symbol versioning, so
+ * defining statx here is safe; the glibc shim keeps it uninterposed
+ * on purpose (an unversioned statx definition crashed BIND_NOW glibc
+ * binaries at relocation, see the file header) and glibc guests reach
+ * every stat through the hooked fstatat instead.  The buffer is
+ * passed through untouched: only the path needs translating. */
+int statx(int dirfd, const char *pathname, int flags,
+          unsigned int mask, struct statx *statxbuf)
+{
+        char buf[PATH_MAX];
+
+        init_real_all_once();
+        return real_statx(dirfd,
+                          xlate_follow(buf, sizeof(buf), pathname),
+                          flags, mask, statxbuf);
+}
+#endif /* !__GLIBC__ */
 
 /* ------------------------------------------------------------------ */
 /* access / metadata / directory ops                                   */
@@ -2375,6 +2565,23 @@ char *getcwd(char *buf, size_t size)
                 memmove(res, res + g_root_len, rest + 1);
         }
         return res;
+}
+
+/* chdir was the one path-taking syscall nobody interposed: "cd /" in
+ * the guest shell therefore landed on the HOST root -- the device log
+ * showed an Android /system, a Permission-denied / and /data, and a
+ * "cd /root" failing because ANDROID has no /root.  Route guest
+ * absolute paths through the same translation open(2) uses; relative
+ * paths keep resolving against the (already host-side) cwd, and
+ * fchdir takes an fd with no path at all. */
+int chdir(const char *path)
+{
+        char buf[PATH_MAX];
+
+        init_real_all_once();
+        if (path != NULL && path[0] == '/')
+                path = xlate(buf, sizeof(buf), path);
+        return real_chdir(path);
 }
 
 /* ------------------------------------------------------------------ */
