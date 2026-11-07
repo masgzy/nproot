@@ -40,6 +40,15 @@ preload/libnproot-musl.so: preload/nproot_preload.c
 check: all
 	./run-tests.sh
 
+# Host regression test for the EFAULT-safe shield scan: proves the
+# scanner no longer dies with SIGBUS on an executable mapping whose
+# pages extend past the backing file's EOF (the musl-device crash),
+# while still patching every stub on the readable pages.
+check-shield:
+	$(CC) $(CFLAGS) -Wno-format-truncation -Wno-nonnull-compare \
+	    -o shield_snapshot_test shield_snapshot_test.c -ldl
+	./shield_snapshot_test
+
 # Cross-build for aarch64 Android: a static-musl launcher plus one shim
 # per guest libc family.  zig cc bundles both sysroots, so neither the
 # NDK nor musl-gcc is needed.  See ANDROID.md for the device-side usage.
@@ -73,6 +82,7 @@ android-x86_64:
 
 clean:
 	-rm -f preload/libnproot.so libnproot.so launcher/nproot-lite
+	-rm -f shield_snapshot_test
 	-rm -rf bin
 
 .PHONY: all check android clean

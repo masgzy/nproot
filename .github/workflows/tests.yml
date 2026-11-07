@@ -114,6 +114,12 @@ jobs:
             CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src"
           file src/nproot
 
+      - name: Shield scan snapshot regression (host)
+        # The EFAULT-safe scan must skip pages beyond a backing file's
+        # EOF instead of dying with SIGBUS BUS_ADRERR (the musl-device
+        # crash), and still patch every stub on the readable pages.
+        run: make -C proto check-shield
+
       - name: Fetch guest rootfsen (glibc + musl)
         run: |
           set -eux

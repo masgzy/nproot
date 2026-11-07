@@ -78,6 +78,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <spawn.h>
@@ -888,6 +889,13 @@ static void patch_dangerous_syscalls(void)
 #define NPROOT_SYS_PIPE2 59
 #endif
 #endif
+#ifndef NPROOT_SYS_PROCESS_VM_READV
+#if defined(__x86_64__)
+#define NPROOT_SYS_PROCESS_VM_READV 310
+#elif defined(__aarch64__)
+#define NPROOT_SYS_PROCESS_VM_READV 270
+#endif
+#endif
 
 /* The census runs inside processes whose filter traps exotic syscalls
  * (observed on Android 15 x86_64: the legacy pipe(2), nr 22, is
@@ -1262,8 +1270,120 @@ static int shield_apply_patches(void)
         return ok;
 }
 
-/* Scan [start, end) for stubs of blocked numbers; returns patches made */
-static int shield_scan_range(uintptr_t start, uintptr_t end)
+/* ---- EFAULT-safe view of the scanned memory ------------------------
+ * The scan used to read the guest mappings straight out of the live
+ * address space, which is exactly what /proc/self/maps promises is
+ * mapped.  On a real musl device that read died with SIGBUS
+ * BUS_ADRERR (si_code=2) at a FIXED offset inside an executable
+ * file-backed mapping: a mapping can cover pages the backing file no
+ * longer provides (a short or mutated rootfs image), and nobody
+ * touches those pages until this scanner comes along -- the loader
+ * only reads headers/dynamic/relocations, and the guest has not
+ * started running yet.  process_vm_readv(2) on self answers EFAULT
+ * for such pages instead of faulting, so the snapshot copies the
+ * range page-by-page, 0xFF-fills whatever is unreadable (no stub
+ * pattern can match 0xFF), and the scan proceeds over what is really
+ * there. */
+static int g_shield_pvmr;       /* 0 unknown, 1 usable, -1 unusable */
+
+static long shield_pvmr_copy(void *local, uintptr_t remote, size_t len)
+{
+        struct iovec liov, riov;
+        static long pid = -1;
+
+        if (pid < 0)
+                pid = syscall(NPROOT_SYS_GETPID);
+        liov.iov_base = local;
+        liov.iov_len = len;
+        riov.iov_base = (void *)remote;
+        riov.iov_len = len;
+        return syscall(NPROOT_SYS_PROCESS_VM_READV, pid,
+                       &liov, 1UL, &riov, 1UL, 0UL);
+}
+
+/* One-time probe against the shim's own data (always mapped): a
+ * failure here means the syscall itself is unavailable -- old kernel,
+ * or the app filter blocks/traps it, in which case the generic
+ * syscall() door refuses the number before the kernel ever sees it.
+ * The caller then scans the live memory as before, which is fine on
+ * every kernel where no mapping covers pages beyond the backing
+ * file's EOF (i.e. everywhere this crash has not been observed). */
+static int shield_pvmr_usable(void)
+{
+        int probe = 0;
+        long r;
+
+        if (g_shield_pvmr == 0) {
+                r = shield_pvmr_copy(&probe, (uintptr_t)&probe,
+                                     sizeof(probe));
+                g_shield_pvmr = (r == (long)sizeof(probe)) ? 1 : -1;
+        }
+        return g_shield_pvmr > 0;
+}
+
+/* Copy [start, end) into a fresh anonymous buffer.  Returns 0 with
+ * *@data_out = the buffer (munmap it once scanned, length = end -
+ * start); unreadable pages are 0xFF-filled and counted in
+ * *@skipped_out.  Returns -1 when process_vm_readv cannot be used --
+ * the caller falls back to scanning the live memory. */
+static int shield_snapshot_range(uintptr_t start, uintptr_t end,
+                                 unsigned char **data_out, int *skipped_out)
+{
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+        size_t len = (size_t)(end - start), done = 0, chunk;
+        unsigned char *buf;
+        long r;
+
+        *skipped_out = 0;
+        buf = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (buf == MAP_FAILED)
+                return -1;
+        while (done < len) {
+                r = shield_pvmr_copy(buf + done, start + done,
+                                     len - done);
+                if (r > 0) {
+                        done += (size_t)r;
+                        continue;
+                }
+                if (r < 0 && errno != EFAULT) {
+                        munmap(buf, len);
+                        return -1;
+                }
+                /* a page in the rest is unreadable: walk the remainder
+                 * one page at a time, skipping whatever faults */
+                for (;;) {
+                        chunk = pg - ((start + done) & (pg - 1));
+                        if (chunk > len - done)
+                                chunk = len - done;
+                        r = shield_pvmr_copy(buf + done, start + done,
+                                             chunk);
+                        if (r == (long)chunk) {
+                                done += chunk;
+                        } else {
+                                if (r < 0 && errno != EFAULT &&
+                                    errno != ENOMEM) {
+                                        munmap(buf, len);
+                                        return -1;
+                                }
+                                memset(buf + done, 0xFF, chunk);
+                                done += chunk;
+                                (*skipped_out)++;
+                        }
+                        if (done >= len)
+                                break;
+                }
+        }
+        *data_out = buf;
+        return 0;
+}
+
+/* Scan [start, end) for stubs of blocked numbers; @data is the bytes
+ * to scan (a snapshot buffer, or (const unsigned char *)start for the
+ * legacy live-memory scan).  Patch sites are still reported as guest
+ * addresses (start + offset).  Returns patches made. */
+static int shield_scan_range(uintptr_t start, uintptr_t end,
+                             const unsigned char *data)
 {
         uintptr_t len, off;
         int patched = 0;
@@ -1282,7 +1402,7 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 unsigned int ins, nr;
                 int w, svc_w = 0;
 
-                memcpy(&ins, (const void *)(start + off), 4);
+                memcpy(&ins, data + off, 4);
                 /* The fixed pattern INCLUDING Rd: syscall numbers go in
                  * x8 by ABI, and glibc/bionic stubs are always "movz
                  * x8, #nr".  0xD2800008 keeps the x8 register field in
@@ -1322,8 +1442,7 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
 
                         if (off + 4 + 4 * w > len)
                                 break;
-                        memcpy(&word,
-                               (const void *)(start + off + 4 * w), 4);
+                        memcpy(&word, data + off + 4 * w, 4);
                         if (word == 0xD4000001u) {
                                 svc_w = w;
                                 break;  /* "svc #0" found */
@@ -1349,7 +1468,7 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 { 0xB8, 0xDA, 0xFF, 0xFF, 0xFF, 0x90, 0x90 };
 
         for (off = 0; off + 7 <= len; off++) {
-                const unsigned char *p = (const unsigned char *)(start + off);
+                const unsigned char *p = data + off;
                 unsigned nr;
 
                 if (p[0] != 0xB8 || p[5] != 0x0F || p[6] != 0x05)
@@ -1357,10 +1476,12 @@ static int shield_scan_range(uintptr_t start, uintptr_t end)
                 memcpy(&nr, p + 1, 4);
                 if (!shield_is_blocked(nr))
                         continue;
-                shield_collect((void *)p, rep, sizeof(rep));
+                /* the patch site is the GUEST address (start + off); p
+                 * may point into the snapshot buffer */
+                shield_collect((void *)(start + off), rep, sizeof(rep));
                 patched++;
                 dbg("shield: queued nr=%u stub at %p", nr,
-                    (const void *)p);
+                    (void *)(start + off));
                 off += 6;
         }
 #endif
@@ -1493,11 +1614,25 @@ static int shield_harden_maps(void)
                                         if (path != NULL && perms_x &&
                                             strncmp(path, "/system/lib", 11) != 0 &&
                                             strstr(path, "libnproot") == NULL) {
-                                                int hits;
+                                                int hits, skipped = 0;
+                                                unsigned char *snap = NULL;
+                                                const unsigned char *data =
+                                                        (const unsigned char *)
+                                                        start;
 
                                                 g_shield_scan_ranges++;
+                                                if (shield_pvmr_usable() &&
+                                                    shield_snapshot_range(
+                                                            start, end, &snap,
+                                                            &skipped) == 0)
+                                                        data = snap;
                                                 hits = shield_scan_range(start,
-                                                                         end);
+                                                                         end,
+                                                                         data);
+                                                if (snap != NULL)
+                                                        munmap(snap,
+                                                               (size_t)(end -
+                                                                        start));
                                                 /* count STUBS, not mappings:
                                                  * "hardened 3" once meant "3
                                                  * mappings had hits" while 54
@@ -1505,6 +1640,14 @@ static int shield_harden_maps(void)
                                                  * patched -- wildly misleading
                                                  * on a diagnosis log */
                                                 patched += hits;
+                                                if (skipped > 0)
+                                                        dbg("shield: %s: "
+                                                            "skipped %d unreada"
+                                                            "ble page(s) in "
+                                                            "[%lx,%lx)", path,
+                                                            skipped,
+                                                            (unsigned long)start,
+                                                            (unsigned long)end);
                                         }
                                 }
                         }
