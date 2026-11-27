@@ -28,6 +28,16 @@ override CPPFLAGS += -Daccess=nproot_access -Dunlink=nproot_unlink \
 	-Dchmod=nproot_chmod -Dsymlink=nproot_symlink -Dpipe=nproot_pipe \
 	-Dstat=nproot_stat -Dlstat=nproot_lstat
 CFLAGS   += -Wall -Wextra -O2
+# -Werror=format: a printf argument-count mismatch is always a bug,
+# never noise.  note()'s colored banner shipped one (8 conversions,
+# 7 arguments) and every colored run -- every real terminal, that is;
+# CI's piped stderr keeps colors off -- dereferenced the stale stack
+# slot at the 8th %s and died of SIGSEGV before printing a byte.  The
+# -Wall line had been warning about it all along; scrollback is not a
+# defense.  Format checking only, so unrelated -Wall/-Wextra notes
+# stay non-fatal.
+CFLAGS   += -Werror=format -Wno-error=format-truncation \
+            -Wno-error=format-overflow
 # Link talloc through this knob, so packagers can swap in a static
 # archive instead, e.g.
 #     make ... TALLOC_LINK=/path/to/libtalloc.a   (or -l:libtalloc.a)

@@ -109,9 +109,20 @@ void note(const Tracee *tracee, Severity severity, Origin origin, const char *me
                 }
 
                 if (colored)
+                        /* 8 conversions, 8 arguments: the trailing
+                         * %s re-opens the body hue so the message
+                         * vfprintf() writes next lands in it, and
+                         * the reset below closes it.  With only 7
+                         * arguments the 8th %s read a stale stack
+                         * slot and dereferenced it -- note() then
+                         * died of SIGSEGV before a byte reached the
+                         * terminal on every colored run (device
+                         * reports: pd sh / nproot -0 segfault with
+                         * no output; pipes kept colors off, which
+                         * is why every CI run stayed green). */
                         fprintf(stderr, "%s%s%s %s%s%s%s: %s",
                                 cli_color_bold(CLI_HUE_BLUE), tool_name, rst,
-                                tag, label, rst, body);
+                                tag, label, rst, body, body);
                 else
                         fprintf(stderr, "%s %s: ", tool_name, label);
 
