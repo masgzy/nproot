@@ -25,8 +25,20 @@ jobs:
         with:
           persist-credentials: false
 
-      # 同 nproot-ci.yml：浅克隆没有 tag 引用，CHECK_VERSION 的
-      # `git describe --tags --abbrev=8 --always` 回退到 commit
+      # checkout 一个 tag ref 会把 tag 引用一起带下来，于是
+      # CHECK_VERSION 的 `git describe --tags ...` 命中 tag 名
+      # （"v5.1.107.107"），而 pd update 只认 8-hex commit hash
+      # （_NPROOT_VERSION_RE）——首跑就栽在这。删掉 tag 引用，
+      # describe --always 退回 hash，与 nproot-ci 浅克隆的行为一致。
+      - name: Drop the tag ref so describe falls back to the 8-hex hash
+        run: |
+          set -eux
+          TAG="$(git describe --tags 2>/dev/null || true)"
+          if [ -n "$TAG" ]; then git tag -d "$TAG"; fi
+          git describe --tags --dirty --abbrev=8 --always
+
+      # 同 nproot-ci.yml：CHECK_VERSION 的
+      # `git describe --tags --abbrev=8 --always` 现在回退到 commit
       # hash——二进制里嵌的正是 pd update 校验的 8-hex token。
 
       - name: Build talloc for Android
