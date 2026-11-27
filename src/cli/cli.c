@@ -36,6 +36,8 @@
 #endif
 #include <limits.h>        /* INT_MAX, */
 
+#include "cli/colors.h"
+
 #include "cli/cli.h"
 #include "cli/note.h"
 #include "env_sanitize.h"
@@ -111,23 +113,37 @@ void print_usage(Tracee *tracee, const Cli *cli, bool detailed)
  */
 void print_version(const Cli *cli)
 {
-        printf("%s %s\n\n", cli->logo, cli->version);
+        /* stdout 版块和 pd 的 `version` 块同一套 Catppuccin 规则
+         * （cli/colors.c），只是这里判 stdout 自己的 tty：`nproot -V |
+         * grep` 是常见用法，管道里必须保持纯文本。 */
+        int colored = cli_colors_enabled_stdout();
+        const char *rst = colored ? cli_reset_out() : "";
+        const char *title = colored ? cli_color_bold_out(CLI_HUE_MAUVE) : "";
+        const char *body = colored ? cli_color_out(CLI_HUE_TEXT) : "";
+        const char *info = colored ? cli_color_out(CLI_HUE_SKY) : "";
+        const char *good = colored ? cli_color_out(CLI_HUE_GREEN) : "";
+        const char *bad = colored ? cli_color_out(CLI_HUE_PEACH) : "";
+
+        printf("%s%s %s%s\n\n", title, cli->logo, cli->version, rst);
         /* The LD_PRELOAD (proto) backend is the default since phase 1
          * of docs/BACKENDS.md; the ptrace backend remains the fallback
          * and can be forced with NPROOT_BACKEND=ptrace.  */
-        printf("拦截后端：proto（默认，不可用时回退 ptrace）\n");
-        printf("内置加速器：process_vm = %s，seccomp_filter = %s\n",
+        printf("%s拦截后端：%s proto%s（默认，不可用时回退 ptrace）%s\n",
+               body, good, body, rst);
+        /* 是/否 keeps its literal bytes in every mode; only the hue
+         * wraps it, so a piped `nproot -V` still answers the question. */
+        printf("%s内置加速器：process_vm = %s%s%s，seccomp_filter = %s%s%s\n",
+               body,
 #if defined(HAVE_PROCESS_VM)
-                "是",
+               good, "是", body,
 #else
-                "否",
+               bad, "否", body,
 #endif
 #if defined(HAVE_SECCOMP_FILTER)
-                "是"
+               good, "是", rst);
 #else
-                "否"
+               bad, "否", rst);
 #endif
-                );
 }
 
 static void print_execve_help(const Tracee *tracee, const char *argv0, int status)

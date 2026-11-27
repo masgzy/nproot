@@ -28,6 +28,7 @@
 #include <stdlib.h> /* getenv(3), */
 #include <unistd.h> /* isatty(3), STDERR_FILENO, */
 
+#include "cli/colors.h"
 #include "cli/note.h"
 #include "tracee/tracee.h"
 
@@ -35,34 +36,27 @@ int global_verbose_level;
 const char *global_tool_name;
 
 /* 用户界面文案默认中文；输出到终端时按 proot-distro-i18n (pd) 的
- * 配色上色：工具名粗体蓝，信息绿、警告黄、错误红，正文青/黄/红。
- * 仅当 stderr 是终端且未设 NPROOT_NO_COLOR 时启用，重定向到文件
- * 或管道（测试、日志）时保持纯文本。 */
-#define C_RST    "\033[0m"
-#define C_NAME   "\033[1;34m" /* 工具名：粗体蓝，对应 pd 的 "[*]" */
-#define C_INFO   "\033[1;32m" /* "信息" 标签：粗体绿 */
-#define C_WARN   "\033[1;33m" /* "警告" 标签：粗体黄 */
-#define C_ERROR  "\033[1;31m" /* "错误" 标签：粗体红 */
-#define C_IBODY  "\033[36m"   /* 信息正文：青 */
-#define C_WBODY  "\033[33m"   /* 警告正文：黄 */
-#define C_EBODY  "\033[31m"   /* 错误正文：红 */
+ * Catppuccin 配色上色：工具名粗体蓝（对应 pd 的 "[*]"），信息/
+ * 警告/错误标签绿/黄/红，正文 sky/黄/红。配色与降级规则（Mocha/
+ * Latte、truecolor、16 色回退、NO_COLOR）见 cli/colors.c——与 pd
+ * 的 message.py 同一套。仅当 stderr 是终端且未设 NO_COLOR/
+ * NPROOT_NO_COLOR 时启用，重定向到文件或管道（测试、日志）时
+ * 保持纯文本。 */
 
 static int colors_enabled(void)
 {
         int saved_errno = errno;
-        static int cached = -1;
+        int enabled;
 
-        if (cached < 0) {
-                const char *disable = getenv("NPROOT_NO_COLOR");
-
-                cached = (disable == NULL && isatty(STDERR_FILENO));
-        }
+        enabled = cli_colors_enabled();
         /* isatty(3) on a piped stderr fails with ENOTTY and clobbers
          * errno; the ERROR+SYSTEM path below reports errno with
          * perror(3) and must still see the exec/whatever failure it
-         * is about to report. */
+         * is about to report.  cli_colors_enabled() only probes
+         * getenv/isatty, but the restore stays so nothing downstream
+         * notices the probe. */
         errno = saved_errno;
-        return cached;
+        return enabled;
 }
 
 /**
@@ -89,26 +83,35 @@ void note(const Tracee *tracee, Severity severity, Origin origin, const char *me
 
         {
                 const char *label, *tag, *body;
+                const char *rst;
                 int colored = colors_enabled();
 
+                rst = cli_reset();
                 switch (severity) {
                 case WARNING:
-                        label = "警告"; tag = C_WARN; body = C_WBODY;
+                        label = "警告";
+                        tag = colored ? cli_color_bold(CLI_HUE_PEACH) : "";
+                        body = colored ? cli_color(CLI_HUE_YELLOW) : "";
                         break;
 
                 case ERROR:
-                        label = "错误"; tag = C_ERROR; body = C_EBODY;
+                        label = "错误";
+                        tag = colored ? cli_color_bold(CLI_HUE_RED) : "";
+                        body = colored ? cli_color(CLI_HUE_RED) : "";
                         break;
 
                 case INFO:
                 default:
-                        label = "信息"; tag = C_INFO; body = C_IBODY;
+                        label = "信息";
+                        tag = colored ? cli_color_bold(CLI_HUE_GREEN) : "";
+                        body = colored ? cli_color(CLI_HUE_SKY) : "";
                         break;
                 }
 
                 if (colored)
-                        fprintf(stderr, C_NAME "%s" C_RST " %s%s" C_RST ": %s",
-                                tool_name, tag, label, body);
+                        fprintf(stderr, "%s%s%s %s%s%s%s: %s",
+                                cli_color_bold(CLI_HUE_BLUE), tool_name, rst,
+                                tag, label, rst, body);
                 else
                         fprintf(stderr, "%s %s: ", tool_name, label);
 
@@ -136,7 +139,7 @@ void note(const Tracee *tracee, Severity severity, Origin origin, const char *me
                 }
 
                 if (colored)
-                        fprintf(stderr, C_RST);
+                        fprintf(stderr, "%s", rst);
         }
 
         return;

@@ -49,6 +49,7 @@ OBJECTS += \
 	env_sanitize.o          \
 	fileat_wrap.o           \
 	cli/cli.o               \
+	cli/colors.o            \
 	cli/proot.o             \
 	cli/note.o              \
 	execve/enter.o          \
