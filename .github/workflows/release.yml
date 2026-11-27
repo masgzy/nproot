@@ -1,0 +1,127 @@
+name: 发布 nproot-android-arm64.zip 到 GitHub Release
+
+# pd update 只认 masgzy/nproot 的 latest Release：它下载
+# nproot-android-arm64.zip、校验内部布局（nproot / host-census /
+# preload/libnproot*.so）与版本 token（8-hex），然后装到
+# ~/.local/bin。打 tag 前这个流程全靠手工，v5.1.107.106 就是
+# 只推了 tag 没发 Release，用户的 `pd update` 至今拿到的仍是
+# 107.105——本工作流让"打 tag"自动等于"可更新"。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建 Release 并上传 asset
+
+jobs:
+  android-release:
+    name: build + release (aarch64, bionic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # 同 nproot-ci.yml：浅克隆没有 tag 引用，CHECK_VERSION 的
+      # `git describe --tags --abbrev=8 --always` 回退到 commit
+      # hash——二进制里嵌的正是 pd update 校验的 8-hex token。
+
+      - name: Build talloc for Android
+        run: |
+          set -eux
+          sh build-aux/fetch-talloc.sh
+          tar -xzf talloc-2.4.2.tar.gz
+          cd talloc-2.4.2
+          sed -i 's/local_abi.extend(\["!_end", "!__bss_start", "!_edata"\])//' \
+              buildtools/wafsamba/samba_abi.py
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          LD="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          LDFLAGS="-Wl,--undefined-version" \
+          ./configure --prefix="$PWD/../talloc-out" --cross-compile \
+                      --cross-answers="$GITHUB_WORKSPACE/build-aux/talloc-answers.txt" \
+                      --disable-python --disable-rpath --without-gettext
+          make -j"$(nproc)"
+          make install
+          ARBIN="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rm -f ../talloc-out/lib/libtalloc.a
+          "$ARBIN/llvm-ar" rcs ../talloc-out/lib/libtalloc.a \
+              bin/default/talloc.c*.o
+
+      - name: Build nproot (talloc statically linked)
+        run: |
+          set -eux
+          BIN="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          make -C src -j"$(nproc)" \
+            CC="$BIN/aarch64-linux-android24-clang" \
+            STRIP="$BIN/llvm-strip" OBJCOPY="$BIN/llvm-objcopy" OBJDUMP="$BIN/llvm-objdump" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I$PWD/src -I$PWD/talloc-out/include" \
+            TALLOC_LINK="$PWD/talloc-out/lib/libtalloc.a" \
+            LDFLAGS="-Wl,-z,noexecstack"
+          file src/nproot
+          if "$BIN/llvm-readelf" -d src/nproot | grep -q libtalloc; then
+            echo "nproot still dynamically depends on talloc" >&2
+            exit 1
+          fi
+          # pd update 的版本 token：必须是 8-hex（_NPROOT_VERSION_RE）。
+          # 打 tag 的浅克隆里 describe 回退 hash，这里把它打出来留档；
+          # 若 CI 有一天带全历史，这一步会当场拦下 "v5.1..." 形态。
+          NPROOT_ID="$(git describe --tags --dirty --abbrev=8 --always 2>/dev/null || echo unknown)"
+          echo "NPROOT_BUILD_ID = $NPROOT_ID"
+          echo "$NPROOT_ID" | grep -Eq '\b[0-9a-f]{8}(-dirty)?\b' || {
+            echo "build id is not an 8-hex token: $NPROOT_ID" >&2
+            exit 1
+          }
+
+      - name: Build the preload shims for the proto backend
+        run: |
+          set -eux
+          pip install ziglang
+          Z="python3 -m ziglang cc"
+          ZFLAGS="-O2 -Wall -Wextra -Wl,-z,max-page-size=16384 -Wl,-z,noexecstack"
+          NPROOT_ID="$(git describe --tags --dirty --abbrev=8 --always 2>/dev/null || echo unknown)"
+          mkdir -p pkg/preload
+          $Z -target aarch64-linux-gnu $ZFLAGS -fPIC -shared \
+            -DNPROOT_PATCH_SYSCALLS=1 -DNPROOT_BUILD_ID="\"$NPROOT_ID\"" \
+            -o pkg/preload/libnproot.so proto/preload/nproot_preload.c -ldl
+          $Z -target aarch64-linux-musl -dynamic $ZFLAGS -fPIC -shared \
+            -DNPROOT_BUILD_ID="\"$NPROOT_ID\"" \
+            -o pkg/preload/libnproot-musl.so proto/preload/nproot_preload.c -ldl
+          $Z -target aarch64-linux-musl $ZFLAGS -static \
+            -o pkg/host-census proto/census/host_census.c
+          cp src/nproot pkg/nproot
+          # 与 CI 同一套"绝不出残次品"断言
+          strings pkg/preload/libnproot.so | grep -q 'seccomp trap'
+          strings pkg/preload/libnproot-musl.so | grep -q 'seccomp trap'
+          strings pkg/preload/libnproot.so | grep -q 'NPROOT_BUILD_ID'
+          strings pkg/nproot | grep -q 'NPROOT_BUILD_ID'
+          strings pkg/nproot | grep -q 'Android seccomp'
+
+      - name: Pack and verify the archive layout
+        # pd update 的 _NPROOT_ENTRY_RE 只接受这三种名字，布局即合同。
+        run: |
+          set -eux
+          cd pkg
+          zip -q ../nproot-android-arm64.zip nproot host-census preload/libnproot.so preload/libnproot-musl.so
+          cd ..
+          unzip -l nproot-android-arm64.zip
+          for n in nproot host-census preload/libnproot.so preload/libnproot-musl.so; do
+            unzip -t nproot-android-arm64.zip "$n" >/dev/null
+          done
+          # 二进制内嵌 hash 与本次 describe 一致（same-zip，防新旧混包）
+          EXPECTED="$(git describe --tags --dirty --abbrev=8 --always 2>/dev/null || echo unknown)"
+          unzip -p nproot-android-arm64.zip nproot | strings | grep -q "$EXPECTED"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # name 与 body 都用 tag 本身，与 v5.1.107.105 的手工形态一致
+          name: ${{ github.ref_name }}
+          body: |
+            自动构建（nproot-android-arm64.zip：nproot + host-census + proto 后端 preload shims）。
+
+            安装：`pd update`（proot-distro-i18n 自带）；或手动解包放到 `~/.local/bin`。
+          files: nproot-android-arm64.zip
+          fail_on_unmatched_files: true
